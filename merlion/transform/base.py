@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -67,6 +67,13 @@ class TransformBase(metaclass=AutodocABCMeta):
         """
         return True
 
+    @property
+    def identity_inversion(self):
+        """
+        Indicates whether the inverse applied by this transform is just the identity.
+        """
+        return not self.requires_inversion_state
+
     def to_dict(self):
         state = {"name": type(self).__name__}
         for k in inspect.signature(self.__init__).parameters:
@@ -87,8 +94,7 @@ class TransformBase(metaclass=AutodocABCMeta):
     @abstractmethod
     def train(self, time_series: TimeSeries):
         """
-        Sets all trainable parameters of the transform (if any), using the input
-        time series as training data.
+        Sets all trainable parameters of the transform (if any), using the input time series as training data.
         """
         raise NotImplementedError
 
@@ -111,9 +117,8 @@ class TransformBase(metaclass=AutodocABCMeta):
         :return: The (inverse) transformed time series.
         """
         if not self.proper_inversion:
-            logger.info(
-                f"Transform {self} is not strictly invertible. "
-                f"Calling invert() is not guaranteed to recover the "
+            logger.warning(
+                f"Transform {self} is not strictly invertible. Calling invert() is not guaranteed to recover the "
                 f"original time series exactly!"
             )
 
@@ -174,6 +179,10 @@ class InvertibleTransformBase(TransformBase):
         """
         return True
 
+    @property
+    def identity_inversion(self):
+        return False
+
     @abstractmethod
     def _invert(self, time_series: TimeSeries) -> TimeSeries:
         raise NotImplementedError
@@ -193,6 +202,10 @@ class Identity(InvertibleTransformBase):
         ``False`` because the identity operation is stateless to invert.
         """
         return False
+
+    @property
+    def identity_inversion(self):
+        return True
 
     def train(self, time_series: TimeSeries):
         pass

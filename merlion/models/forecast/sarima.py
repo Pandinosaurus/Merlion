@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -10,29 +10,28 @@ A variant of ARIMA with a user-specified Seasonality.
 
 import logging
 import warnings
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
 import numpy as np
-from merlion.utils import autosarima_utils
-from scipy.stats import norm
-from statsmodels.tsa.arima.model import ARIMA as sm_Sarima
+import pandas as pd
+import statsmodels.api as sm
 
 from merlion.models.automl.seasonality import SeasonalityModel
-from merlion.models.forecast.base import ForecasterBase, ForecasterConfig
+from merlion.models.forecast.base import ForecasterExogBase, ForecasterExogConfig
 from merlion.transform.resample import TemporalResample
-from merlion.utils.time_series import TimeSeries, UnivariateTimeSeries
+from merlion.utils.time_series import UnivariateTimeSeries, to_pd_datetime, to_timestamp
 
 logger = logging.getLogger(__name__)
 
 
-class SarimaConfig(ForecasterConfig):
+class SarimaConfig(ForecasterExogConfig):
     """
     Config class for `Sarima` (Seasonal AutoRegressive Integrated Moving Average).
     """
 
     _default_transform = TemporalResample(granularity=None)
 
-    def __init__(self, order=(4, 1, 2), seasonal_order=(2, 0, 1, 24), **kwargs):
+    def __init__(self, order: List[int] = (4, 1, 2), seasonal_order: List[int] = (2, 0, 1, 24), **kwargs):
         """
         :param order: Order is (p, d, q) for an ARIMA(p, d, q) process. d must
             be an integer indicating the integration order of the process, while
@@ -47,7 +46,7 @@ class SarimaConfig(ForecasterConfig):
         self.seasonal_order = seasonal_order
 
 
-class Sarima(ForecasterBase, SeasonalityModel):
+class Sarima(ForecasterExogBase, SeasonalityModel):
     """
     Implementation of the classic statistical model SARIMA (Seasonal
     AutoRegressive Integrated Moving Average) for forecasting.
@@ -58,7 +57,15 @@ class Sarima(ForecasterBase, SeasonalityModel):
     def __init__(self, config: SarimaConfig):
         super().__init__(config)
         self.model = None
-        self.last_val = None
+        self._last_val = None
+
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
+
+    @property
+    def _default_train_config(self):
+        return dict(enforce_stationarity=False, enforce_invertibility=False)
 
     @property
     def order(self) -> Tuple[int, int, int]:
@@ -86,133 +93,79 @@ class Sarima(ForecasterBase, SeasonalityModel):
             return 0
         return 2 * orders["reduced_ar"] + 1
 
-    def train(self, train_data: TimeSeries, train_config=None):
-        # Train the transform & transform the training data
-        train_data = self.train_pre_process(train_data, require_even_sampling=True, require_univariate=False)
-
+    def _train_with_exog(
+        self, train_data: pd.DataFrame, train_config=None, exog_data: pd.DataFrame = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         # train model
         name = self.target_name
-        train_data = train_data.univariates[name].to_pd()
+        train_data = train_data[name]
         times = train_data.index
+        train_config = train_config or {}
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            self.model = sm_Sarima(
-                train_data,
-                order=self.order,
-                seasonal_order=self.seasonal_order,
-                enforce_stationarity=False,
-                enforce_invertibility=False,
-            ).fit(method_kwargs={"disp": 0})
+            model = sm.tsa.SARIMAX(
+                train_data, exog=exog_data, order=self.order, seasonal_order=self.seasonal_order, **train_config
+            )
+            self.model = model.fit(disp=0)
 
         # FORECASTING: forecast for next n steps using Sarima model
-        forecast_result = self.model.get_forecast(self.max_forecast_steps)
-        self.last_val = train_data[-1]
-
+        self._last_val = train_data[-1]
         yhat = (train_data.values - self.model.resid).tolist()
         err = [np.sqrt(self.model.params["sigma2"])] * len(train_data)
-        return (
-            UnivariateTimeSeries(times, yhat, name).to_ts(),
-            UnivariateTimeSeries(times, err, f"{name}_err").to_ts(),
-        )
+        return pd.DataFrame(yhat, index=times, columns=[name]), pd.DataFrame(err, index=times, columns=[f"{name}_err"])
 
-    def forecast(
+    def _forecast_with_exog(
         self,
-        time_stamps: Union[int, List[int]],
-        time_series_prev: TimeSeries = None,
-        return_iqr=False,
+        time_stamps: List[int],
+        time_series_prev: pd.DataFrame = None,
         return_prev=False,
-    ) -> Union[Tuple[TimeSeries, TimeSeries], Tuple[TimeSeries, TimeSeries, TimeSeries]]:
-        # Make sure the timestamps are valid (spaced at the right timedelta)
-        # If time_series_prev is None, i0 is the first index of the pre-computed
-        # forecast, which we'd like to start returning a forecast from
-        orig_t = None if isinstance(time_stamps, (int, float)) else time_stamps
-        time_stamps = self.resample_time_stamps(time_stamps, time_series_prev)
-
-        # transform time_series_prev if relevant (before making the prediction)
-        if time_series_prev is not None:
-            time_series_prev = self.transform(time_series_prev)
-
+        exog_data: pd.DataFrame = None,
+        exog_data_prev: pd.DataFrame = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        # If there is a time_series_prev, use it to set the SARIMA model's state, and then obtain its forecast
         if time_series_prev is None:
-            forecast_result = self.model.get_forecast(len(time_stamps))
-            forecast = forecast_result.predicted_mean
-            err = forecast_result.se_mean
-            if any(np.isnan(forecast)):
-                logger.warning(
-                    "Trained SARIMA model is producing NaN forecast.Use the last "
-                    "point in the training data as the prediction."
-                )
-                forecast[np.isnan(forecast)] = self.last_val
-            if any(np.isnan(err)):
-                err[np.isnan(err)] = 0
-
-        # If there is a time_series_prev, use it to set the ARIMA model's state,
-        # and then obtain its forecast (and standard error of that forecast)
+            last_val = self._last_val
+            model = self.model
         else:
-            k = time_series_prev.names[self.target_seq_index]
-            time_series_prev = time_series_prev.univariates[k]
-            t_prev = time_series_prev.time_stamps
-            val_prev = time_series_prev.np_values[-self._max_lookback :]
+            val_prev = time_series_prev.iloc[-self._max_lookback :, self.target_seq_index]
+            last_val = val_prev[-1]
+            exog_data_prev = None if exog_data_prev is None else exog_data_prev.loc[val_prev.index]
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model = self.model.apply(val_prev, exog=exog_data_prev, validate_specification=False)
 
-            try:
-                new_state = self.model.apply(val_prev, validate_specification=False)
-                forecast_result = new_state.get_forecast(len(time_stamps))
-                forecast = forecast_result.predicted_mean
-                err = forecast_result.se_mean
-                assert len(forecast) == len(time_stamps), (
-                    f"Expected SARIMA model to return forecast of length {len(time_stamps)}, but got "
-                    f"{len(forecast)} instead."
-                )
-            except Exception as e:
-                logger.warning(f"Caught {type(e).__name__}: {str(e)}")
-                forecast = np.full(len(time_stamps), val_prev[-1])
-                err = np.zeros(len(time_stamps))
+        try:
+            forecast_result = model.get_forecast(len(time_stamps), exog=exog_data)
+            pred = np.asarray(forecast_result.predicted_mean)
+            err = np.asarray(forecast_result.se_mean)
+            assert len(pred) == len(
+                time_stamps
+            ), f"Expected SARIMA to return forecast of length {len(time_stamps)}, but got {len(pred)} instead."
+        except Exception as e:
+            logger.warning(f"Caught {type(e).__name__}: {str(e)}")
+            pred = np.full(len(time_stamps), last_val)
+            err = np.zeros(len(time_stamps))
 
-            if return_prev:
-                n_prev = len(time_series_prev)
-                params = dict(zip(new_state.param_names, new_state.params))
-                err_prev = np.sqrt(params["sigma2"])
-                forecast = np.concatenate((val_prev - new_state.resid, forecast))
-                err = np.concatenate((err_prev * np.ones(n_prev), err))
-                time_stamps = t_prev + time_stamps
-                orig_t = None if orig_t is None else t_prev + orig_t
+        if time_series_prev is not None and return_prev:
+            m = len(time_series_prev) - len(val_prev)
+            params = dict(zip(model.param_names, model.params))
+            err_prev = np.concatenate((np.zeros(m), np.full(len(val_prev), np.sqrt(params["sigma2"]))))
+            pred = np.concatenate((time_series_prev.values[:m, self.target_seq_index], val_prev - model.resid, pred))
+            err = np.concatenate((err_prev, err))
+            time_stamps = np.concatenate((to_timestamp(time_series_prev.index), time_stamps))
 
-        # Return the IQR (25%ile & 75%ile) along with the forecast if desired
+        # Check for NaN's
+        if any(np.isnan(pred)):
+            logger.warning("Trained SARIMA model producing NaN forecast. Using last training point as the prediction.")
+            pred[np.isnan(pred)] = last_val
+        if any(np.isnan(err)):
+            err[np.isnan(err)] = 0
+
+        # Return the forecast & its standard error
         name = self.target_name
-        if return_iqr:
-            lb = (
-                UnivariateTimeSeries(
-                    name=f"{name}_lower", time_stamps=time_stamps, values=forecast + norm.ppf(0.25) * err
-                )
-                .to_ts()
-                .align(reference=orig_t)
-            )
-            ub = (
-                UnivariateTimeSeries(
-                    name=f"{name}_upper", time_stamps=time_stamps, values=forecast + norm.ppf(0.75) * err
-                )
-                .to_ts()
-                .align(reference=orig_t)
-            )
-            forecast = (
-                UnivariateTimeSeries(name=name, time_stamps=time_stamps, values=forecast)
-                .to_ts()
-                .align(reference=orig_t)
-            )
-            return forecast, lb, ub
-
-        # Otherwise, just return the forecast & its standard error
-        else:
-            forecast = (
-                UnivariateTimeSeries(name=name, time_stamps=time_stamps, values=forecast)
-                .to_ts()
-                .align(reference=orig_t)
-            )
-            err = (
-                UnivariateTimeSeries(name=f"{name}_err", time_stamps=time_stamps, values=err)
-                .to_ts()
-                .align(reference=orig_t)
-            )
-            return forecast, err
+        pred = pd.DataFrame(pred, index=to_pd_datetime(time_stamps), columns=[name])
+        err = pd.DataFrame(err, index=to_pd_datetime(time_stamps), columns=[f"{name}_err"])
+        return pred, err
 
     def set_seasonality(self, theta, train_data: UnivariateTimeSeries):
         # Make sure seasonality is a positive int, and set it to 1 if the train data is constant

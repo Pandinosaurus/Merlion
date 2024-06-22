@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -10,9 +10,9 @@ The classic isolation forest model for anomaly detection.
 import logging
 
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import IsolationForest as skl_IsolationForest
 
-from merlion.evaluate.anomaly import TSADMetric
 from merlion.models.anomaly.base import DetectorConfig, DetectorBase
 from merlion.transform.moving_average import DifferenceTransform
 from merlion.transform.sequence import TransformSequence
@@ -29,7 +29,7 @@ class IsolationForestConfig(DetectorConfig):
 
     _default_transform = TransformSequence([DifferenceTransform(), Shingle(size=2, stride=1)])
 
-    def __init__(self, max_n_samples: int = None, n_estimators: int = 100, **kwargs):
+    def __init__(self, max_n_samples: int = None, n_estimators: int = 100, n_jobs=-1, **kwargs):
         """
         :param max_n_samples: Maximum number of samples to allow the isolation
             forest to train on. Specify ``None`` to use all samples in the
@@ -38,6 +38,7 @@ class IsolationForestConfig(DetectorConfig):
         """
         self.max_n_samples = 1.0 if max_n_samples is None else max_n_samples
         self.n_estimators = n_estimators
+        self.n_jobs = n_jobs
         # Isolation forest's uncalibrated scores are between 0 and 1
         kwargs["max_score"] = 1.0
         super().__init__(**kwargs)
@@ -54,30 +55,24 @@ class IsolationForest(DetectorBase):
     def __init__(self, config: IsolationForestConfig):
         super().__init__(config)
         self.model = skl_IsolationForest(
-            max_samples=config.max_n_samples, n_estimators=config.n_estimators, random_state=0
+            max_samples=config.max_n_samples, n_estimators=config.n_estimators, random_state=0, n_jobs=config.n_jobs
         )
 
-    def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
-    ) -> TimeSeries:
-        train_data = self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
-        times, train_values = zip(*train_data.align())
-        train_values = np.asarray(train_values)
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
 
+    @property
+    def require_univariate(self) -> bool:
+        return False
+
+    def _train(self, train_data: pd.DataFrame, train_config=None) -> pd.DataFrame:
+        times, train_values = train_data.index, train_data.values
         self.model.fit(train_values)
         train_scores = -self.model.score_samples(train_values)
-        train_scores = TimeSeries({"anom_score": UnivariateTimeSeries(times, train_scores)})
-        self.train_post_rule(
-            anomaly_scores=train_scores, anomaly_labels=anomaly_labels, post_rule_train_config=post_rule_train_config
-        )
-        return train_scores
+        return pd.DataFrame(train_scores, index=times, columns=["anom_score"])
 
-    def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
-        time_series, _ = self.transform_time_series(time_series, time_series_prev)
-        time_stamps, values = zip(*time_series.align())
-        values = np.asarray(values)
-
-        # Return negative of model's score, since model scores are in (0, -1],
-        # where more negative = more anomalous
-        scores = -self.model.score_samples(np.array(values))
-        return TimeSeries({"anom_score": UnivariateTimeSeries(time_stamps, scores)})
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
+        # Return the negative of model's score, since model scores are in [-1, 0), where more negative = more anomalous
+        scores = -self.model.score_samples(np.array(time_series.values))
+        return pd.DataFrame(scores, index=time_series.index)

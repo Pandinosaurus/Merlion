@@ -1,9 +1,12 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 #
+"""
+Miscellaneous low-level utilities (not for end users).
+"""
 from abc import ABCMeta
 from collections import OrderedDict
 from copy import deepcopy
@@ -11,7 +14,7 @@ from functools import wraps
 import importlib
 import inspect
 import re
-from typing import Union
+from typing import Callable, Union
 
 
 class AutodocABCMeta(ABCMeta):
@@ -63,7 +66,7 @@ class ModelConfigMeta(type):
                 sig = combine_signatures(sig, inspect.signature(cls_.__init__))
 
                 # Parse the __init__ docstring. Use the earliest prefix/param docstring in the MRO.
-                prefix_, suffix_, params_ = parse_init_docstring(cls_.__init__.__doc__)
+                prefix_, suffix_, params_ = parse_basic_docstring(cls_.__init__.__doc__)
                 if prefix is None and any([line != "" for line in prefix_]):
                     prefix = "\n".join(prefix_)
                 if suffix is None and any([line != "" for line in suffix_]):
@@ -108,7 +111,10 @@ def combine_signatures(sig1: Union[inspect.Signature, None], sig2: Union[inspect
     return sig1.replace(parameters=params)
 
 
-def parse_init_docstring(docstring):
+def parse_basic_docstring(docstring):
+    """
+    Parse the docstring of a model config's ``__init__``, or other basic docstring.
+    """
     docstring_lines = [""] if docstring is None else docstring.split("\n")
     prefix, suffix, param_dict = [], [], OrderedDict()
     non_empty_lines = [line for line in docstring_lines if len(line) > 0]
@@ -141,10 +147,8 @@ def dynamic_import(import_path: str, alias: dict = None):
     """
     Dynamically import a member from the specified module.
 
-    :param import_path: syntax 'module_name:member_name',
-        e.g. 'merlion.transform.normalize:PowerTransform'
-    :param alias: dict which maps shortcuts for the registered classes, to their
-        full import paths.
+    :param import_path: syntax 'module_name:member_name', e.g. 'merlion.transform.normalize:BoxCoxTransform'
+    :param alias: dict which maps shortcuts for the registered classes, to their full import paths.
     :return: imported class
     """
     alias = dict() if alias is None else alias
@@ -160,6 +164,17 @@ def dynamic_import(import_path: str, alias: dict = None):
     module_name, objname = import_path.split(":")
     m = importlib.import_module(module_name)
     return getattr(m, objname)
+
+
+def call_with_accepted_kwargs(fn: Callable, **kwargs):
+    """
+    Given a function and a list of keyword arguments, call the function with only the keyword arguments that are
+    accepted by the function.
+    """
+    params = inspect.signature(fn).parameters
+    if not any(v.kind.name == "VAR_KEYWORD" for v in params.values()):
+        kwargs = {k: v for k, v in kwargs.items() if k in params}
+    return fn(**kwargs)
 
 
 def initializer(func):
@@ -182,7 +197,7 @@ def initializer(func):
 
 
 class ProgressBar:
-    def __init__(self, total: int, length: int = 40, decimals: int = 1, fill: str = "█"):
+    def __init__(self, total: int, length: int = 40, decimals: int = 1, fill: str = "="):
         """
         :param total: total iterations
         :param length: character length of bar
@@ -203,7 +218,7 @@ class ProgressBar:
         """
         percent = ("{0:." + str(self.decimals) + "f}").format(100 * (iteration / float(self.total)))
         fill_len = self.length * iteration // self.total
-        bar = self.fill * fill_len + "-" * (self.length - fill_len)
+        bar = self.fill * fill_len + " " * (self.length - fill_len)
         print(f"\r{prefix} |{bar}| {percent}% {suffix}", end=end)
         if iteration >= self.total:
             print()

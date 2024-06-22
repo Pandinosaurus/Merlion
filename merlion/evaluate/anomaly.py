@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -16,7 +16,8 @@ import numpy as np
 import pandas as pd
 
 from merlion.evaluate.base import EvaluatorBase, EvaluatorConfig
-from merlion.utils import TimeSeries
+from merlion.utils import TimeSeries, UnivariateTimeSeries
+from merlion.utils.misc import call_with_accepted_kwargs
 
 
 def scaled_sigmoid(x, scale=2.5):
@@ -117,7 +118,7 @@ class TSADScoreAccumulator:
             prec_score_type = rec_score_type = score_type
         p = self.precision(prec_score_type)
         r = self.recall(rec_score_type)
-        return 0.0 if p == 0 or r == 0 else (1 + beta ** 2) * p * r / (beta ** 2 * p + r)
+        return 0.0 if p == 0 or r == 0 else (1 + beta**2) * p * r / (beta**2 * p + r)
 
     def mean_time_to_detect(self):
         t = np.mean(self.tp_detection_delays) if self.tp_detection_delays else 0
@@ -168,7 +169,11 @@ class TSADScoreAccumulator:
 
 
 def accumulate_tsad_score(
-    ground_truth: TimeSeries, predict: TimeSeries, max_early_sec=None, max_delay_sec=None, metric=None
+    ground_truth: Union[TimeSeries, UnivariateTimeSeries],
+    predict: Union[TimeSeries, UnivariateTimeSeries],
+    max_early_sec=None,
+    max_delay_sec=None,
+    metric=None,
 ) -> Union[TSADScoreAccumulator, float]:
     """
     Computes the components required to compute multiple different types of
@@ -191,6 +196,8 @@ def accumulate_tsad_score(
         returns a ``float``. The `TSADScoreAccumulator` object is returned if
         ``metric`` is ``None``.
     """
+    ground_truth = ground_truth.to_ts() if isinstance(ground_truth, UnivariateTimeSeries) else ground_truth
+    predict = predict.to_ts() if isinstance(predict, UnivariateTimeSeries) else predict
     assert (
         ground_truth.dim == 1 and predict.dim == 1
     ), "Can only evaluate anomaly scores when ground truth and prediction are single-variable time series."
@@ -385,24 +392,26 @@ class TSADEvaluator(EvaluatorBase):
     def max_delay_sec(self):
         return self.config.max_delay_sec
 
-    def _call_model(self, time_series: TimeSeries, time_series_prev: TimeSeries) -> TimeSeries:
-        return self.model.get_anomaly_score(time_series, time_series_prev)
+    def _call_model(
+        self, time_series: TimeSeries, time_series_prev: TimeSeries, exog_data: TimeSeries = None
+    ) -> TimeSeries:
+        kwargs = dict(time_series=time_series, time_series_prev=time_series_prev, exog_data=exog_data)
+        return call_with_accepted_kwargs(self.model.get_anomaly_score, **kwargs)
 
     def default_retrain_kwargs(self) -> dict:
-        from merlion.models.ensemble.anomaly import DetectorEnsemble
+        from merlion.models.ensemble.anomaly import DetectorEnsemble, DetectorEnsembleTrainConfig
 
         no_train = dict(metric=None, unsup_quantile=None, retrain_calibrator=False)
         if isinstance(self.model, DetectorEnsemble):
-            return {
-                "post_rule_train_config": no_train,
-                "per_model_post_rule_train_configs": [no_train] * len(self.model.models),
-            }
+            train_config = DetectorEnsembleTrainConfig(per_model_train_configs=[no_train] * len(self.model.models))
+            return {"post_rule_train_config": no_train, "train_config": train_config}
         return {"post_rule_train_config": no_train}
 
     def get_predict(
         self,
         train_vals: TimeSeries,
         test_vals: TimeSeries,
+        exog_data: TimeSeries = None,
         train_kwargs: dict = None,
         retrain_kwargs: dict = None,
         post_process=True,
@@ -415,6 +424,7 @@ class TSADEvaluator(EvaluatorBase):
         :param train_vals: initial training data
         :param test_vals: all data where we want to get the model's predictions
             and compare it to the ground truth
+        :param exog_data: any exogenous data (only used for some models)
         :param train_kwargs: dict of keyword arguments we want to use for the
             initial training process. Typically, you will want to provide the
             key "anomaly_labels" here, if you have training data with labeled
@@ -431,11 +441,15 @@ class TSADEvaluator(EvaluatorBase):
             `TimeSeries` of the model's anomaly scores on ``test_vals``.
         """
         train_result, result = super().get_predict(
-            train_vals=train_vals, test_vals=test_vals, train_kwargs=train_kwargs, retrain_kwargs=retrain_kwargs
+            train_vals=train_vals,
+            test_vals=test_vals,
+            exog_data=exog_data,
+            train_kwargs=train_kwargs,
+            retrain_kwargs=retrain_kwargs,
         )
         if post_process:
             train_result = self.model.post_rule(train_result)
-            result = self.model.post_rule(result)
+            result = None if result is None else self.model.post_rule(result)
         return train_result, result
 
     def evaluate(

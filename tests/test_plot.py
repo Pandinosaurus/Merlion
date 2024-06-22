@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -12,10 +12,13 @@ import sys
 import unittest
 
 from merlion.transform.base import Identity
+from merlion.transform.moving_average import DifferenceTransform
+from merlion.transform.normalize import BoxCoxTransform
 from merlion.transform.resample import TemporalResample
 from merlion.models.anomaly.forecast_based.prophet import ProphetDetector, ProphetDetectorConfig
+from merlion.models.forecast.trees import LGBMForecaster, LGBMForecasterConfig
 from merlion.plot import plot_anoms, plot_anoms_plotly
-from merlion.utils.time_series import ts_csv_load
+from merlion.utils.data_io import csv_to_time_series
 
 logger = logging.getLogger(__name__)
 rootdir = dirname(dirname(abspath(__file__)))
@@ -26,7 +29,7 @@ class TestPlot(unittest.TestCase):
         super().__init__(*args, **kwargs)
 
         self.csv_name = join(rootdir, "data", "example.csv")
-        data = ts_csv_load(self.csv_name)
+        data = csv_to_time_series(self.csv_name, timestamp_unit="ms")
         self.data = TemporalResample("15min")(data.univariates[data.names[0]].to_ts())
         self.labels = data.univariates[data.names[1]].to_ts()
         logger.info(f"Data looks like:\n{self.data[:5]}")
@@ -35,15 +38,46 @@ class TestPlot(unittest.TestCase):
         self.test_len = math.ceil(len(self.data) / 5)
         self.vals_train = self.data[: -self.test_len]
         self.vals_test = self.data[-self.test_len :]
-        self.model = ProphetDetector(ProphetDetectorConfig(transform=Identity(), uncertainty_samples=1000))
 
     def test_plot(self):
         print("-" * 80)
         logger.info("test_plot\n" + "-" * 80 + "\n")
+        self.model = ProphetDetector(
+            ProphetDetectorConfig(transform=Identity(), invert_transform=False, uncertainty_samples=1000)
+        )
+        self._test_plot(subdir="basic")
+
+    def test_plot_transform_inv(self):
+        print("-" * 80)
+        logger.info("test_plot_transform_inv\n" + "-" * 80 + "\n")
+        self.model = ProphetDetector(
+            ProphetDetectorConfig(transform=BoxCoxTransform(), invert_transform=True, uncertainty_samples=1000)
+        )
+        self._test_plot(subdir="transform_inv")
+
+    def test_plot_transform_no_inv(self):
+        print("-" * 80)
+        logger.info("test_plot_transform_no_inv\n" + "-" * 80 + "\n")
+        self.model = ProphetDetector(
+            ProphetDetectorConfig(transform=DifferenceTransform(), invert_transform=False, uncertainty_samples=1000)
+        )
+        self._test_plot(subdir="transform_no_inv")
+
+    def test_no_uncertainty(self):
+        self.model = LGBMForecaster(
+            LGBMForecasterConfig(transform=TemporalResample("1h"), maxlags=24 * 7, prediction_stride=24)
+        )
+        self.model.train(self.vals_train)
+        fig, _ = self.model.plot_forecast(time_series=self.vals_test, plot_forecast_uncertainty=True)
+        figdir = join(rootdir, "tmp", "plot", "no_uncertainty")
+        os.makedirs(figdir, exist_ok=True)
+        fig.savefig(join(figdir, "lgbm_forecast.png"))
+
+    def _test_plot(self, subdir):
         logger.info("Training model...\n")
         self.model.train(self.vals_train)
 
-        figdir = join(rootdir, "tmp", "plot")
+        figdir = join(rootdir, "tmp", "plot", subdir)
         os.makedirs(figdir, exist_ok=True)
 
         # Test various plots with matplotlib

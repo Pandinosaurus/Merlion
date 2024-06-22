@@ -1,4 +1,3 @@
-
 merlion.models package
 ======================
 Broadly, Merlion contains two types of models: anomaly detection (:py:mod:`merlion.models.anomaly`)
@@ -58,37 +57,67 @@ Finally, we support ensembles of models in :py:mod:`merlion.models.ensemble`.
    :show-inheritance:
 
 .. autosummary::
+    defaults
     factory
     base
+    deep_base
     layers
-    defaults
     anomaly
     anomaly.change_point
     anomaly.forecast_based
     forecast
     ensemble
     automl
+    utils
 
 
 Subpackages
 -----------
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 3
 
    merlion.models.anomaly
+
+.. toctree::
+   :maxdepth: 2
+
    merlion.models.anomaly.change_point
    merlion.models.anomaly.forecast_based
+
+.. toctree::
+   :maxdepth: 3
+
    merlion.models.forecast
+
+.. toctree::
+   :maxdepth: 2
+
    merlion.models.ensemble
+
+
+.. toctree::
+   :maxdepth: 3
+
    merlion.models.automl
 
+.. toctree::
+   :maxdepth: 2
 
-Submodules
-----------
+   merlion.models.utils
 
-merlion.models.factory module
------------------------------
+
+defaults
+--------
+
+.. automodule:: merlion.models.defaults
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+
+factory
+-------
 
 .. automodule:: merlion.models.factory
    :members:
@@ -96,26 +125,26 @@ merlion.models.factory module
    :show-inheritance:
 
 
-merlion.models.base module
---------------------------
+base
+----
 
 .. automodule:: merlion.models.base
    :members:
    :undoc-members:
    :show-inheritance:
 
-merlion.models.layers module
-----------------------------
+deep\_base
+----------
 
-.. automodule:: merlion.models.layers
+.. automodule:: merlion.models.deep_base
    :members:
    :undoc-members:
    :show-inheritance:
 
-merlion.models.defaults module
-------------------------------
+layers
+------
 
-.. automodule:: merlion.models.defaults
+.. automodule:: merlion.models.layers
    :members:
    :undoc-members:
    :show-inheritance:

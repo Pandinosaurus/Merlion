@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,17 +7,31 @@
 """
 Deep autoencoding Gaussian mixture model for anomaly detection (DAGMM)
 """
+import copy
+import random
+from typing import List
+
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+except ImportError as e:
+    err = (
+        "Try installing Merlion with optional dependencies using `pip install salesforce-merlion[deep-learning]` or "
+        "`pip install `salesforce-merlion[all]`"
+    )
+    raise ImportError(str(e) + ". " + err)
+
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from merlion.utils import UnivariateTimeSeries, TimeSeries
+import pandas as pd
+
+from merlion.utils import TimeSeries
 from merlion.models.base import NormalizingConfig
-from merlion.models.anomaly.base import DetectorBase, DetectorConfig
+from merlion.models.anomaly.base import DetectorBase, DetectorConfig, MultipleTimeseriesDetectorMixin
 from merlion.post_process.threshold import AggregateAlarms
 from merlion.utils.misc import ProgressBar, initializer
-from merlion.models.anomaly.utils import InputData, batch_detect
+from merlion.models.utils.rolling_window_dataset import RollingWindowDataset
 
 
 class DAGMMConfig(DetectorConfig, NormalizingConfig):
@@ -54,7 +68,7 @@ class DAGMMConfig(DetectorConfig, NormalizingConfig):
         super().__init__(**kwargs)
 
 
-class DAGMM(DetectorBase):
+class DAGMM(DetectorBase, MultipleTimeseriesDetectorMixin):
     """
     Deep autoencoding Gaussian mixture model for anomaly detection (DAGMM).
     DAGMM combines an autoencoder with a Gaussian mixture model to model the distribution
@@ -85,6 +99,18 @@ class DAGMM(DetectorBase):
         self.dagmm, self.optimizer = None, None
         self.train_energy, self._threshold = None, None
 
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
+
+    @property
+    def require_univariate(self) -> bool:
+        return False
+
+    @property
+    def _default_train_config(self):
+        return dict()
+
     def _build_model(self, dim):
         hidden_size = self.hidden_size + int(dim / 20)
         dagmm = DAGMMModule(
@@ -112,25 +138,28 @@ class DAGMM(DetectorBase):
         self.optimizer.step()
         return total_loss, sample_energy, recon_error, cov_diag
 
-    def _train(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
-        dataset = InputData(X, k=self.sequence_length)
-        data_loader = DataLoader(
-            dataset=dataset, batch_size=self.batch_size, shuffle=True, collate_fn=InputData.collate_func
+    def _train(self, train_data: pd.DataFrame, train_config=None):
+        data_loader = RollingWindowDataset(
+            train_data,
+            target_seq_index=None,
+            shuffle=True,
+            flatten=False,
+            n_past=self.sequence_length,
+            n_future=0,
+            batch_size=self.batch_size,
         )
-        self.dagmm = self._build_model(X.shape[1]).to(self.device)
-        self.optimizer = torch.optim.Adam(self.dagmm.parameters(), lr=self.lr)
-        self.data_dim = X.shape[1]
+        if self.dagmm is None and self.optimizer is None:
+            self.dagmm = self._build_model(train_data.shape[1]).to(self.device)
+            self.optimizer = torch.optim.Adam(self.dagmm.parameters(), lr=self.lr)
+            self.dagmm.train()
+        self.data_dim = train_data.shape[1]
         bar = ProgressBar(total=self.num_epochs)
 
-        self.dagmm.train()
         for epoch in range(self.num_epochs):
             total_loss, recon_error = 0, 0
-            for input_data in data_loader:
-                input_data = input_data.to(self.device)
-                loss, _, error, _ = self._step(input_data.float())
+            for input_data, _, _, _ in data_loader:
+                input_data = torch.tensor(input_data, dtype=torch.float, device=self.device)
+                loss, _, error, _ = self._step(input_data)
                 total_loss += loss
                 recon_error += error
             if bar is not None:
@@ -142,69 +171,82 @@ class DAGMM(DetectorBase):
                     ),
                 )
 
-    def _detect(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
-        self.dagmm.eval()
-        dataset = InputData(X, k=self.sequence_length)
-        data_loader = DataLoader(dataset=dataset, batch_size=1, shuffle=False)
-        test_energy = np.full((self.sequence_length, X.shape[0]), np.nan)
+        return self._get_anomaly_score(train_data)
 
-        for i, sequence in enumerate(data_loader):
-            sequence = sequence.to(self.device)
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
+        self.dagmm.eval()
+        ts = pd.concat((time_series_prev, time_series)) if time_series_prev is None else time_series
+        data_loader = RollingWindowDataset(
+            ts,
+            target_seq_index=None,
+            shuffle=False,
+            flatten=False,
+            n_past=self.sequence_length,
+            n_future=0,
+            batch_size=1,
+        )
+        test_energy = np.full((self.sequence_length, ts.shape[0]), np.nan)
+
+        for i, (sequence, _, _, _) in enumerate(data_loader):
+            sequence = torch.tensor(sequence, dtype=torch.float, device=self.device)
             enc, dec, z, gamma = self.dagmm(sequence.float())
             sample_energy, _ = self.dagmm.compute_energy(z, size_average=False)
             idx = (i % self.sequence_length, np.arange(i, i + self.sequence_length))
             test_energy[idx] = sample_energy.cpu().data.numpy()
-
         test_energy = np.nanmean(test_energy, axis=0)
-        return test_energy
+        return pd.DataFrame(test_energy[-len(time_series) :], index=time_series.index)
 
-    def _get_sequence_len(self):
-        return self.sequence_length
-
-    def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
-    ) -> TimeSeries:
+    def train_multiple(
+        self,
+        multiple_train_data: List[TimeSeries],
+        train_config=None,
+        anomaly_labels: List[TimeSeries] = None,
+        post_rule_train_config=None,
+    ) -> List[TimeSeries]:
         """
-        Train a multivariate time series anomaly detector.
+        Trains the anomaly detector (unsupervised) and its post-rule
+        (supervised, if labels are given) on the input multiple time series.
 
-        :param train_data: A `TimeSeries` of metric values to train the model.
-        :param anomaly_labels: A `TimeSeries` indicating which timestamps are
-            anomalous. Optional.
-        :param train_config: Additional training configs, if needed. Only
-            required for some models.
+        :param multiple_train_data: a list of `TimeSeries` of metric values to train the model.
+        :param train_config: Additional training config dict with keys:
+
+            * | "n_epochs": ``int`` indicating how many times the model must be
+              | trained on the timeseries in ``multiple_train_data``. Defaults to 1.
+            * | "shuffle": ``bool`` indicating if the ``multiple_train_data`` collection
+              | should be shuffled before every epoch. Defaults to True if "n_epochs" > 1.
+        :param anomaly_labels: a list of `TimeSeries` indicating which timestamps are  anomalous. Optional.
         :param post_rule_train_config: The config to use for training the
             model's post-rule. The model's default post-rule train config is
             used if none is supplied here.
 
-        :return: A `TimeSeries` of the model's anomaly scores on the training
-            data.
+        :return: A list of `TimeSeries` of the model's anomaly scores on the training
+            data with each element corresponds to time series from ``multiple_train_data``.
         """
-        train_data = self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
+        if train_config is None:
+            train_config = copy.deepcopy(self._default_train_config)
+        n_epochs = train_config.pop("n_epochs", 1)
+        shuffle = train_config.pop("shuffle", n_epochs > 1)
 
-        train_df = train_data.align().to_pd()
-        self._train(train_df.values)
-        scores = batch_detect(self, train_df.values)
-
-        train_scores = TimeSeries({"anom_score": UnivariateTimeSeries(train_data.time_stamps, scores)})
-        self.train_post_rule(
-            anomaly_scores=train_scores, anomaly_labels=anomaly_labels, post_rule_train_config=post_rule_train_config
-        )
-        return train_scores
-
-    def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
-        """
-        :param time_series: The `TimeSeries` we wish to predict anomaly scores for.
-        :param time_series_prev: A `TimeSeries` immediately preceding ``time_series``.
-        :return: A univariate `TimeSeries` of anomaly scores
-        """
-        time_series, time_series_prev = self.transform_time_series(time_series, time_series_prev)
-        ts = time_series_prev + time_series if time_series_prev is not None else time_series
-        scores = batch_detect(self, ts.align().to_pd().values)
-        timestamps = time_series.time_stamps
-        return TimeSeries({"anom_score": UnivariateTimeSeries(timestamps, scores[-len(timestamps) :])})
+        if anomaly_labels is not None:
+            assert len(multiple_train_data) == len(anomaly_labels)
+        else:
+            anomaly_labels = [None] * len(multiple_train_data)
+        train_scores_list = []
+        for _ in range(n_epochs):
+            if shuffle:
+                random.shuffle(multiple_train_data)
+            for train_data, anomaly_series in zip(multiple_train_data, anomaly_labels):
+                train_scores_list.append(
+                    self.train(
+                        train_data=train_data,
+                        train_config=train_config,
+                        anomaly_labels=anomaly_series,
+                        post_rule_train_config=post_rule_train_config
+                        # FIXME: the post-rule (calibrator and threshold) is trained individually on each time series
+                        # but ideally it needs to be re-trained on all of the `train_scores_list`
+                    )
+                )
+        return train_scores_list
 
 
 class AEModule(nn.Module):
@@ -297,7 +339,7 @@ class DAGMMModule(nn.Module):
         cov_inv, cov_det, cov_diag = [], [], 0
         for i in range(cov.shape[0]):
             cov_k = cov[i] + torch.eye(cov.shape[1], device=self.device) * eps
-            inv_k = torch.FloatTensor(np.linalg.pinv(cov_k.cpu().data.numpy())).to(self.device)
+            inv_k = torch.tensor(np.linalg.pinv(cov_k.cpu().data.numpy()), dtype=torch.float, device=self.device)
             cov_inv.append(inv_k.unsqueeze(0))
             eigenvalues = np.linalg.eigvals(cov_k.data.cpu().numpy() * (2 * np.pi))
             determinant = np.prod(np.clip(eigenvalues, a_min=eps, a_max=None))
@@ -306,7 +348,7 @@ class DAGMMModule(nn.Module):
 
         z_mu = z.unsqueeze(1) - mu.unsqueeze(0)
         cov_inv = torch.cat(cov_inv, dim=0)
-        cov_det = torch.FloatTensor(cov_det).to(self.device)
+        cov_det = torch.tensor(cov_det, dtype=torch.float, device=self.device)
         exp_term_tmp = -0.5 * torch.sum(torch.sum(z_mu.unsqueeze(-1) * cov_inv.unsqueeze(0), dim=-2) * z_mu, dim=-1)
         max_val = torch.max(exp_term_tmp.clamp(min=0), dim=1, keepdim=True)[0]
         exp_term = torch.exp(exp_term_tmp - max_val)

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,17 +7,27 @@
 """
 The VAE-based anomaly detector for multivariate time series
 """
-import torch
-import torch.nn as nn
-import numpy as np
 from typing import Sequence
-from torch.utils.data import DataLoader
-from merlion.utils import UnivariateTimeSeries, TimeSeries
+
+import numpy as np
+import pandas as pd
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+except ImportError as e:
+    err = (
+        "Try installing Merlion with optional dependencies using `pip install salesforce-merlion[deep-learning]` or "
+        "`pip install `salesforce-merlion[all]`"
+    )
+    raise ImportError(str(e) + ". " + err)
+
 from merlion.models.base import NormalizingConfig
 from merlion.models.anomaly.base import DetectorBase, DetectorConfig
 from merlion.post_process.threshold import AggregateAlarms
 from merlion.utils.misc import ProgressBar, initializer
-from merlion.models.anomaly.utils import InputData, batch_detect
+from merlion.models.utils.rolling_window_dataset import RollingWindowDataset
 
 
 class VAEConfig(DetectorConfig, NormalizingConfig):
@@ -89,6 +99,14 @@ class VAE(DetectorBase):
         self.model = None
         self.data_dim = None
 
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
+
+    @property
+    def require_univariate(self) -> bool:
+        return False
+
     def _build_model(self, dim):
         model = CVAE(
             x_dim=dim * self.k,
@@ -101,15 +119,19 @@ class VAE(DetectorBase):
         )
         return model
 
-    def _train(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
-        self.model = self._build_model(X.shape[1]).to(self.device)
-        self.data_dim = X.shape[1]
+    def _train(self, train_data: pd.DataFrame, train_config=None) -> pd.DataFrame:
+        self.model = self._build_model(train_data.shape[1]).to(self.device)
+        self.data_dim = train_data.shape[1]
 
-        input_data = InputData(X, self.k)
-        train_data = DataLoader(input_data, batch_size=self.batch_size, shuffle=True, collate_fn=InputData.collate_func)
+        loader = RollingWindowDataset(
+            train_data,
+            target_seq_index=None,
+            shuffle=True,
+            flatten=True,
+            n_past=self.k,
+            n_future=0,
+            batch_size=self.batch_size,
+        )
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         loss_func = nn.MSELoss()
         bar = ProgressBar(total=self.num_epochs)
@@ -117,12 +139,11 @@ class VAE(DetectorBase):
         self.model.train()
         for epoch in range(self.num_epochs):
             total_loss = 0
-            for i, batch in enumerate(train_data):
-                x = batch.to(self.device)
-                x = torch.flatten(x, start_dim=1)
+            for i, (batch, _, _, _) in enumerate(loader):
+                x = torch.tensor(batch, dtype=torch.float, device=self.device)
                 recon_x, mu, log_var, _ = self.model(x, None)
                 recon_loss = loss_func(x, recon_x)
-                kld_loss = -0.5 * torch.mean(torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
+                kld_loss = -0.5 * torch.mean(torch.sum(1 + log_var - mu**2 - log_var.exp(), dim=1), dim=0)
                 loss = recon_loss + kld_loss * self.kld_weight
                 optimizer.zero_grad()
                 loss.backward()
@@ -130,71 +151,36 @@ class VAE(DetectorBase):
                 total_loss += loss
             if bar is not None:
                 bar.print(epoch + 1, prefix="", suffix="Complete, Loss {:.4f}".format(total_loss / len(train_data)))
+        return self._get_anomaly_score(train_data)
 
-    def _detect(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
         self.model.eval()
-        y = torch.FloatTensor([X[i + 1 - self.k : i + 1, :] for i in range(self.k - 1, X.shape[0])]).to(self.device)
-        y = torch.flatten(y, start_dim=1)
+        ts = pd.concat((time_series_prev, time_series)) if time_series_prev is None else time_series
+        loader = RollingWindowDataset(
+            ts,
+            target_seq_index=None,
+            shuffle=False,
+            flatten=True,
+            n_past=self.k,
+            n_future=0,
+            batch_size=self.batch_size,
+        )
+        ys, rs = [], []
+        for y, _, _, _ in loader:
+            ys.append(y)
+            y = torch.tensor(y, dtype=torch.float, device=self.device)
+            r = np.zeros(y.shape)
+            for _ in range(self.num_eval_samples):
+                recon_y, _, _, _ = self.model(y, None)
+                r += recon_y.cpu().data.numpy()
+            r /= self.num_eval_samples
+            rs.append(r)
 
-        r = np.zeros(y.shape)
-        for _ in range(self.num_eval_samples):
-            recon_y, _, _, _ = self.model(y, None)
-            r += recon_y.cpu().data.numpy()
-        r /= self.num_eval_samples
-
-        scores = np.zeros((X.shape[0],), dtype=float)
-        test_scores = np.sum(np.abs(r - y.cpu().data.numpy()), axis=1)
+        scores = np.zeros((ts.shape[0],), dtype=float)
+        test_scores = np.sum(np.abs(np.concatenate(rs) - np.concatenate(ys)), axis=1)
         scores[self.k - 1 :] = test_scores
         scores[: self.k - 1] = test_scores[0]
-        return scores
-
-    def _get_sequence_len(self):
-        return self.k
-
-    def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
-    ) -> TimeSeries:
-        """
-        Train a multivariate time series anomaly detector.
-
-        :param train_data: A `TimeSeries` of metric values to train the model.
-        :param anomaly_labels: A `TimeSeries` indicating which timestamps are
-            anomalous. Optional.
-        :param train_config: Additional training configs, if needed. Only
-            required for some models.
-        :param post_rule_train_config: The config to use for training the
-            model's post-rule. The model's default post-rule train config is
-            used if none is supplied here.
-
-        :return: A `TimeSeries` of the model's anomaly scores on the training
-            data.
-        """
-        train_data = self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
-
-        train_df = train_data.align().to_pd()
-        self._train(train_df.values)
-        scores = batch_detect(self, train_df.values)
-
-        train_scores = TimeSeries({"anom_score": UnivariateTimeSeries(train_data.time_stamps, scores)})
-        self.train_post_rule(
-            anomaly_scores=train_scores, anomaly_labels=anomaly_labels, post_rule_train_config=post_rule_train_config
-        )
-        return train_scores
-
-    def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
-        """
-        :param time_series: The `TimeSeries` we wish to predict anomaly scores for.
-        :param time_series_prev: A `TimeSeries` immediately preceding ``time_series``.
-        :return: A univariate `TimeSeries` of anomaly scores
-        """
-        time_series, time_series_prev = self.transform_time_series(time_series, time_series_prev)
-        ts = time_series_prev + time_series if time_series_prev is not None else time_series
-        scores = batch_detect(self, ts.align().to_pd().values)
-        timestamps = time_series.time_stamps
-        return TimeSeries({"anom_score": UnivariateTimeSeries(timestamps, scores[-len(timestamps) :])})
+        return pd.DataFrame(scores[-len(time_series) :], index=time_series.index)
 
 
 class CVAE(nn.Module):

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,7 +7,6 @@
 import logging
 import math
 from os.path import abspath, dirname, join
-import pytest
 import sys
 import unittest
 
@@ -19,7 +18,7 @@ from merlion.transform.moving_average import DifferenceTransform
 from merlion.transform.normalize import MeanVarNormalize
 from merlion.transform.resample import Shingle, TemporalResample
 from merlion.transform.sequence import TransformSequence
-from merlion.utils.time_series import ts_csv_load
+from merlion.utils.data_io import csv_to_time_series
 
 rootdir = dirname(dirname(dirname(abspath(__file__))))
 logger = logging.getLogger(__name__)
@@ -29,7 +28,7 @@ class TestRandomCutForest(unittest.TestCase):
     def run_init(self):
         # Resample @ 5min granularity b/c default (1min) takes too long to train
         self.csv_name = join(rootdir, "data", "example.csv")
-        self.data = ts_csv_load(self.csv_name, n_vars=1)
+        self.data = csv_to_time_series(self.csv_name, timestamp_unit="ms", data_cols=["kpi"])
         self.test_len = math.ceil(len(self.data) / 5)
 
         logger.info(f"Data looks like:\n{self.data[:5]}")
@@ -56,19 +55,6 @@ class TestRandomCutForest(unittest.TestCase):
         print()
         logger.info("Training model...\n")
         self.model.train(self.vals_train)
-
-    @pytest.fixture(autouse=True)
-    def fixture(self):
-        # Necessary to avoid jpype-induced segfault due to running JVM in a thread when
-        # running this test with pytest. See the docs here:
-        # https://jpype.readthedocs.io/en/latest/userguide.html#errors-reported-by-python-fault-handler
-        try:
-            import faulthandler
-
-            faulthandler.enable()
-            faulthandler.disable()
-        except:
-            pass
 
     def test_score(self):
         self.run_init()
@@ -118,6 +104,6 @@ class TestRandomCutForest(unittest.TestCase):
 
 if __name__ == "__main__":
     logging.basicConfig(
-        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s", stream=sys.stdout, level=logging.DEBUG
+        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s", stream=sys.stdout, level=logging.INFO
     )
     unittest.main()

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -14,7 +14,8 @@ import numpy as np
 
 from merlion.transform.resample import TemporalResample
 from merlion.models.anomaly.forecast_based.mses import MSESDetector, MSESDetectorConfig
-from merlion.utils.time_series import ts_csv_load, TimeSeries
+from merlion.utils.data_io import csv_to_time_series
+from merlion.utils.time_series import TimeSeries
 
 logger = logging.getLogger(__name__)
 rootdir = dirname(dirname(dirname(dirname(abspath(__file__)))))
@@ -26,7 +27,7 @@ class TestMSES(unittest.TestCase):
 
         # Re-sample to 1hr because default (1min) takes too long to train
         self.csv_name = join(rootdir, "data", "example.csv")
-        self.data = ts_csv_load(self.csv_name, n_vars=1)
+        self.data = csv_to_time_series(self.csv_name, timestamp_unit="ms", data_cols=["kpi"])
         logger.info(f"Data looks like:\n{self.data[:5]}")
 
         self.test_len = math.ceil(len(self.data) / 10)
@@ -47,8 +48,8 @@ class TestMSES(unittest.TestCase):
         # alarm function returns the post-rule processed anomaly scores
         scores = self.model.get_anomaly_score(self.vals_test, self.vals_train)
         logger.info(f"Scores look like:\n{scores[:5]}")
-        logger.info("max score = " + str(max(scores.to_pd().values)))
-        logger.info("min score = " + str(min(scores.to_pd().values)) + "\n")
+        logger.info("max score = " + str(max(scores.to_pd().values.flatten())))
+        logger.info("min score = " + str(min(scores.to_pd().values.flatten())) + "\n")
         alarms = self.model.post_rule(scores)
         n_alarms = np.sum(alarms.to_pd().values != 0)
         logger.info(f"Number of alarms: {n_alarms}\n")

@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -46,6 +46,9 @@ class TestDAGMM(unittest.TestCase):
         logger.info("Training model...\n")
         train_ts = TimeSeries.from_pd(self.train_df)
         self.model.train(train_ts)
+
+        logger.info("Training multiple timeseries model...\n")
+        self.model.train_multiple([train_ts] * 10)
 
     def test_score(self):
         print("-" * 80)

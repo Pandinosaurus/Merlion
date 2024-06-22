@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -83,8 +83,8 @@ class NAB(TSADBaseDataset):
             if len(df["timestamp"][df["timestamp"].diff() == datetime.timedelta(0)]) != 0:
                 df = df.drop_duplicates(subset="timestamp", keep="first")
                 logger.warning(f"Time series {csv} (index {i}) has timestamp duplicates. Kept first values.")
-
-            all_dt = np.unique(np.diff(df["timestamp"])).astype(np.int64)
+                
+            all_dt = np.unique(np.diff(df["timestamp"]))
             gcd_dt = all_dt[0]
             for dt in all_dt[1:]:
                 gcd_dt = np.gcd(gcd_dt, dt)
@@ -192,7 +192,7 @@ class NAB(TSADBaseDataset):
             url = f"https://github.com/numenta/NAB/raw/master/{labelfile}"
             r = requests.get(url, stream=True)
             with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=16 * 1024 ** 2):
+                for chunk in r.iter_content(chunk_size=16 * 1024**2):
                     if chunk:  # filter out keep-alive new chunks
                         f.write(chunk)
                         f.flush()
@@ -205,7 +205,7 @@ class NAB(TSADBaseDataset):
                 url = f"https://github.com/numenta/NAB/raw/master/data/{csv}"
                 r = requests.get(url, stream=True)
                 with open(path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=16 * 1024 ** 2):
+                    for chunk in r.iter_content(chunk_size=16 * 1024**2):
                         if chunk:  # filter out keep-alive new chunks
                             f.write(chunk)
                             f.flush()

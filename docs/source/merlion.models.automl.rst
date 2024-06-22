@@ -1,43 +1,75 @@
-
-merlion.models.automl package
-==============================
+automl
+======
 
 .. automodule:: merlion.models.automl
    :members:
    :undoc-members:
    :show-inheritance:
 
+Base classes:
+
 .. autosummary::
     base
-    seasonality
+
+Models:
+
+.. autosummary::
     autoets
     autoprophet
     autosarima
 
-Submodules
-----------
+Utilities:
 
-merlion.models.automl.base module
----------------------------------
+.. autosummary::
+    seasonality
+    search
 
+Base classes
+------------
+automl.base
+^^^^^^^^^^^
 .. automodule:: merlion.models.automl.base
    :members:
    :undoc-members:
    :show-inheritance:
 
-merlion.models.automl.autosarima module
------------------------------------------
+Models
+------
+automl.autoets
+^^^^^^^^^^^^^^
+.. automodule:: merlion.models.automl.autoets
+   :members:
+   :undoc-members:
+   :show-inheritance:
 
+automl.autoprophet
+^^^^^^^^^^^^^^^^^^
+.. automodule:: merlion.models.automl.autoprophet
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+automl.autosarima
+^^^^^^^^^^^^^^^^^
 .. automodule:: merlion.models.automl.autosarima
    :members:
    :undoc-members:
    :show-inheritance:
 
 
-merlion.models.automl.seasonality module
-----------------------------------------
+Utilities
+---------
 
+automl.seasonality
+^^^^^^^^^^^^^^^^^^
 .. automodule:: merlion.models.automl.seasonality
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+automl.search
+^^^^^^^^^^^^^
+.. automodule:: merlion.models.automl.search
    :members:
    :undoc-members:
    :show-inheritance:

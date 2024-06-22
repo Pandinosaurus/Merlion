@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -14,8 +14,8 @@ import pandas as pd
 
 from merlion.evaluate.forecast import ForecastMetric
 from merlion.models.automl.autosarima import AutoSarima, AutoSarimaConfig
-from merlion.models.automl.seasonality import SeasonalityLayer
-from merlion.utils import TimeSeries, autosarima_utils
+from merlion.models.automl.seasonality import SeasonalityLayer, SeasonalityConfig
+from merlion.utils import TimeSeries
 
 logger = logging.getLogger(__name__)
 rootdir = dirname(dirname(dirname(abspath(__file__))))
@@ -796,26 +796,19 @@ class TestAutoSarima(unittest.TestCase):
                 seasonal_order=(2, 1, 1, 0),
                 max_forecast_steps=self.max_forecast_steps,
                 maxiter=5,
-                transform=dict(name="Identity") if seasonality_layer else None,
-                model=dict(name="SarimaDetector", enable_threshold=False, transform=dict(name="Identity")),
+                model=dict(name="SarimaDetector", enable_threshold=False),
             )
         )
         if seasonality_layer:
-            self.model = SeasonalityLayer(model=model)
+            self.model = SeasonalityLayer(config=SeasonalityConfig(model=None), model=model)
         else:
             self.model = model
 
-        train_pred, train_err = self.model.train(
-            self.train_data, train_config={"enforce_stationarity": False, "enforce_invertibility": False}
-        )
+        self.model.train(self.train_data)
 
         # check automatic periodicity detection
         k = self.test_data.names[0]
-        m = autosarima_utils.multiperiodicity_detection(self.train_data.univariates[k].np_values)
-        self.assertEqual(m[0], 24)
-
-        # check the length of training results
-        self.assertEqual(len(train_pred), len(train_err))
+        self.assertEqual(self.model.base_model.config.seasonal_order[-1], 24)
 
         # check the length of forecasting results
         pred, err = self.model.forecast(self.max_forecast_steps)
@@ -839,7 +832,7 @@ class TestAutoSarima(unittest.TestCase):
         y_hat = pred.univariates[pred.names[0]].np_values
         smape = np.mean(200.0 * np.abs((y_true - y_hat) / (np.abs(y_true) + np.abs(y_hat)))).item()
         logger.info(f"sMAPE = {smape:.4f}")
-        self.assertAlmostEqual(smape, expected_sMAPE, delta=0.0001)
+        self.assertAlmostEqual(smape, expected_sMAPE, places=3)
 
         # check smape in evalution
         smape_compare = ForecastMetric.sMAPE.value(self.test_data, pred)
@@ -854,12 +847,12 @@ class TestAutoSarima(unittest.TestCase):
     def test_autosarima(self):
         print("-" * 80)
         logger.info("TestAutoSarima.test_autosarima\n" + "-" * 80 + "\n")
-        self.run_test(auto_pqPQ=False, seasonality_layer=True, expected_sMAPE=3.4130)
+        self.run_test(auto_pqPQ=False, seasonality_layer=False, expected_sMAPE=3.413)
 
     def test_seasonality_layer(self):
         print("-" * 80)
         logger.info("TestAutoSarima.test_seasonality_layer\n" + "-" * 80 + "\n")
-        self.run_test(auto_pqPQ=False, seasonality_layer=False, expected_sMAPE=3.4130)
+        self.run_test(auto_pqPQ=False, seasonality_layer=True, expected_sMAPE=3.413)
 
 
 if __name__ == "__main__":

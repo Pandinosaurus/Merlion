@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -8,20 +8,22 @@
 Base class for anomaly detectors.
 """
 from abc import abstractmethod
-from copy import copy, deepcopy
+import copy
 import inspect
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
+import pandas as pd
 from scipy.stats import norm
 
-from merlion.models.base import Config, ModelBase
+from merlion.models.base import Config, ModelBase, MultipleTimeseriesModelMixin
 from merlion.plot import Figure, MTSFigure
 from merlion.post_process.calibrate import AnomScoreCalibrator
 from merlion.post_process.factory import PostRuleFactory
 from merlion.post_process.sequence import PostRuleSequence
 from merlion.post_process.threshold import AggregateAlarms, Threshold
-from merlion.utils import TimeSeries
+from merlion.utils import TimeSeries, UnivariateTimeSeries
+from merlion.utils.misc import call_with_accepted_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,8 @@ class DetectorConfig(Config):
     _default_threshold = AggregateAlarms(alm_threshold=3.0)
     calibrator: AnomScoreCalibrator = None
     threshold: Threshold = None
+    enable_calibrator: bool = True
+    enable_threshold: bool = True
 
     def __init__(
         self, max_score: float = 1000, threshold=None, enable_calibrator=True, enable_threshold=True, **kwargs
@@ -54,7 +58,7 @@ class DetectorConfig(Config):
         self.enable_calibrator = enable_calibrator
         self.calibrator = AnomScoreCalibrator(max_score=max_score)
         if threshold is None:
-            self.threshold = deepcopy(self._default_threshold)
+            self.threshold = copy.deepcopy(self._default_threshold)
         elif isinstance(threshold, dict):
             self.threshold = PostRuleFactory.create(**threshold)
         else:
@@ -174,41 +178,59 @@ class DetectorBase(ModelBase):
     def post_rule(self):
         return self.config.post_rule
 
-    @abstractmethod
     def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
+        self, train_data: TimeSeries, train_config=None, anomaly_labels: TimeSeries = None, post_rule_train_config=None
     ) -> TimeSeries:
         """
-        Trains the anomaly detector (unsupervised) and its post-rule
-        (supervised, if labels are given) on the input time series.
+        Trains the anomaly detector (unsupervised) and its post-rule (supervised, if labels are given) on train data.
 
         :param train_data: a `TimeSeries` of metric values to train the model.
-        :param anomaly_labels: a `TimeSeries` indicating which timestamps are
-            anomalous. Optional.
-        :param train_config: Additional training configs, if needed. Only
-            required for some models.
-        :param post_rule_train_config: The config to use for training the
-            model's post-rule. The model's default post-rule train config is
-            used if none is supplied here.
+        :param train_config: Additional training configs, if needed. Only required for some models.
+        :param anomaly_labels: a `TimeSeries` indicating which timestamps are anomalous. Optional.
+        :param post_rule_train_config: The config to use for training the model's post-rule. The model's default
+            post-rule train config is used if none is supplied here.
 
-        :return: A `TimeSeries` of the model's anomaly scores on the training
-            data.
+        :return: A `TimeSeries` of the model's anomaly scores on the training data.
         """
-        raise NotImplementedError
+        if train_config is None:
+            train_config = copy.deepcopy(self._default_train_config)
+        train_data = self.train_pre_process(train_data)
+        train_data = train_data.to_pd() if self._pandas_train else train_data
+        train_result = call_with_accepted_kwargs(  # For ensembles
+            self._train, train_data=train_data, train_config=train_config, anomaly_labels=anomaly_labels
+        )
+        return self.train_post_process(
+            train_result=train_result, anomaly_labels=anomaly_labels, post_rule_train_config=post_rule_train_config
+        )
 
-    def train_post_rule(
-        self, anomaly_scores: TimeSeries, anomaly_labels: TimeSeries = None, post_rule_train_config=None
-    ):
+    def train_post_process(
+        self, train_result: Union[TimeSeries, pd.DataFrame], anomaly_labels=None, post_rule_train_config=None
+    ) -> TimeSeries:
+        """
+        Converts the train result (anom scores on train data) into a TimeSeries object and trains the post-rule.
+
+        :param train_result: Raw anomaly scores on the training data.
+        :param anomaly_labels: a `TimeSeries` indicating which timestamps are anomalous. Optional.
+        :param post_rule_train_config: The config to use for training the model's post-rule. The model's default
+            post-rule train config is used if none is supplied here.
+        """
+        anomaly_scores = UnivariateTimeSeries.from_pd(train_result, name="anom_score").to_ts()
         if self.post_rule is not None:
-            kwargs = copy(self._default_post_rule_train_config)
+            kwargs = copy.copy(self._default_post_rule_train_config)
             if post_rule_train_config is not None:
                 kwargs.update(post_rule_train_config)
-            params = inspect.signature(self.post_rule.train).parameters
-            if not any(v.kind.name == "VAR_KEYWORD" for v in params.values()):
-                kwargs = {k: v for k, v in kwargs.items() if k in params}
-            self.post_rule.train(anomaly_scores=anomaly_scores, anomaly_labels=anomaly_labels, **kwargs)
+            kwargs.update(anomaly_scores=anomaly_scores, anomaly_labels=anomaly_labels)
+            call_with_accepted_kwargs(self.post_rule.train, **kwargs)
+        return anomaly_scores
 
     @abstractmethod
+    def _train(self, train_data: pd.DataFrame, train_config=None) -> pd.DataFrame:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
+        raise NotImplementedError
+
     def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
         """
         Returns the model's predicted sequence of anomaly scores.
@@ -221,7 +243,31 @@ class DetectorBase(ModelBase):
             immediately follows the training data.
         :return: a univariate `TimeSeries` of anomaly scores
         """
-        raise NotImplementedError
+        # Ensure the dimensions are correct
+        assert (
+            time_series.dim == self.dim
+        ), f"Expected time_series to have dimension {self.dim}, but got {time_series.dim}."
+        if time_series_prev is not None:
+            assert (
+                time_series_prev.dim == self.dim
+            ), f"Expected time_series_prev to have dimension {self.dim}, but got {time_series_prev.dim}."
+
+        # Transform the time series
+        time_series, time_series_prev = self.transform_time_series(time_series, time_series_prev)
+        if self.require_univariate:
+            assert time_series.dim == 1, (
+                f"{type(self).__name__} model only accepts univariate time series, but time series "
+                f"(after transform {self.transform}) has dimension {time_series.dim}."
+            )
+
+        time_series = time_series.to_pd()
+        if time_series_prev is not None:
+            time_series_prev = time_series_prev.to_pd()
+
+        # Get the anomaly scores & ensure the dimensions are correct
+        anom_scores = self._get_anomaly_score(time_series, time_series_prev)
+        assert anom_scores.shape[1] == 1, f"Expected anomaly scores returned by {type(self)} to be univariate."
+        return UnivariateTimeSeries.from_pd(anom_scores, name="anom_score").to_ts()
 
     def get_anomaly_label(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
         """
@@ -248,6 +294,7 @@ class DetectorBase(ModelBase):
         filter_scores=True,
         plot_time_series_prev=False,
         fig: Figure = None,
+        **kwargs,
     ) -> Figure:
         """
         :param time_series: The `TimeSeries` we wish to plot & predict anomaly scores for.
@@ -263,7 +310,7 @@ class DetectorBase(ModelBase):
         :return: a `Figure` of the model's anomaly score predictions.
         """
         f = self.get_anomaly_label if filter_scores else self.get_anomaly_score
-        scores = f(time_series, time_series_prev=time_series_prev)
+        scores = f(time_series, time_series_prev=time_series_prev, **kwargs)
         scores = scores.univariates[scores.names[0]]
 
         # Get the severity level associated with each value & convert things to
@@ -352,3 +399,33 @@ class DetectorBase(ModelBase):
         scores = f(time_series, time_series_prev=time_series_prev)
         fig = MTSFigure(y=time_series, y_prev=time_series_prev, anom=scores)
         return fig.plot_plotly(title=title, figsize=figsize)
+
+
+class MultipleTimeseriesDetectorMixin(MultipleTimeseriesModelMixin):
+    """
+    Abstract mixin for anomaly detectors supporting training on multiple time series.
+    """
+
+    @abstractmethod
+    def train_multiple(
+        self,
+        multiple_train_data: List[TimeSeries],
+        train_config=None,
+        anomaly_labels: List[TimeSeries] = None,
+        post_rule_train_config=None,
+    ) -> List[TimeSeries]:
+        """
+        Trains the anomaly detector (unsupervised) and its post-rule
+        (supervised, if labels are given) on the input multiple time series.
+
+        :param multiple_train_data: a list of `TimeSeries` of metric values to train the model.
+        :param anomaly_labels: a list of `TimeSeries` indicating which timestamps are anomalous. Optional.
+        :param train_config: Additional training configs, if needed. Only required for some models.
+        :param post_rule_train_config: The config to use for training the
+            model's post-rule. The model's default post-rule train config is
+            used if none is supplied here.
+
+        :return: A list of `TimeSeries` of the model's anomaly scores on the training
+            data with each element corresponds to time series from ``multiple_train_data``.
+        """
+        raise NotImplementedError

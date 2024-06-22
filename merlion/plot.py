@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -11,26 +11,26 @@ import logging
 from typing import Dict
 from copy import copy
 
+from matplotlib.colors import to_rgb
 from matplotlib.dates import AutoDateLocator, AutoDateFormatter
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import plotly
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 from merlion.utils import TimeSeries, UnivariateTimeSeries
 
 logger = logging.getLogger(__name__)
-try:
-    import plotly
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-except ImportError:
-    logger.warning("plotly not installed, so plotly visualizations will not work.")
 
 
 def plot_anoms(ax: plt.Axes, anomaly_labels: TimeSeries):
     """
     Plots anomalies as pink windows on the matplotlib ``Axes`` object ``ax``.
     """
+    if anomaly_labels is None:
+        return ax
     anomaly_labels = anomaly_labels.to_pd()
     t, y = anomaly_labels.index, anomaly_labels.values
     splits = np.where(y[1:] != y[:-1])[0] + 1
@@ -38,12 +38,15 @@ def plot_anoms(ax: plt.Axes, anomaly_labels: TimeSeries):
     for k in range(len(splits) - 1):
         if y[splits[k]]:  # If splits[k] is anomalous
             ax.axvspan(t[splits[k]], t[splits[k + 1]], color="#e07070", alpha=0.5)
+    return ax
 
 
 def plot_anoms_plotly(fig, anomaly_labels: TimeSeries):
     """
     Plots anomalies as pink windows on the plotly ``Figure`` object ``fig``.
     """
+    if anomaly_labels is None:
+        return fig
     anomaly_labels = anomaly_labels.to_pd()
     t, y = anomaly_labels.index, anomaly_labels.values
     splits = np.where(y[1:] != y[:-1])[0] + 1
@@ -51,6 +54,7 @@ def plot_anoms_plotly(fig, anomaly_labels: TimeSeries):
     for k in range(len(splits) - 1):
         if y[splits[k]]:  # If splits[k] is anomalous
             fig.add_vrect(t[splits[k]], t[splits[k + 1]], line_width=0, fillcolor="#e07070", opacity=0.4)
+    return fig
 
 
 class Figure:
@@ -71,6 +75,7 @@ class Figure:
         yhat_prev: UnivariateTimeSeries = None,
         yhat_prev_lb: UnivariateTimeSeries = None,
         yhat_prev_ub: UnivariateTimeSeries = None,
+        yhat_color: str = None,
     ):
         """
         :param y: the true value of the time series
@@ -82,6 +87,7 @@ class Figure:
         :param yhat_prev: model's forecast of ``y_prev``
         :param yhat_prev_lb: lower bound on ``yhat_prev`` (if model supports uncertainty estimation)
         :param yhat_prev_ub: upper bound on ``yhat_prev`` (if model supports uncertainty estimation)
+        :param yhat_color: the color in which to plot the forecast
         """
         assert not (anom is not None and y is None), "If `anom` is given, `y` must also be given"
 
@@ -115,6 +121,8 @@ class Figure:
             self.yhat_prev_iqr = TimeSeries({"lb": yhat_prev_lb, "ub": yhat_prev_ub}).align()
         else:
             self.yhat_prev_iqr = None
+
+        self.yhat_color = yhat_color if isinstance(yhat_color, str) else "#0072B2"
 
     @property
     def t0(self):
@@ -221,14 +229,14 @@ class Figure:
         if yhat is not None:
             metric_name = yhat.name if metric_name is None else metric_name
             yhat_label = full_label_alias.get("yhat")
-            ln = ax.plot(yhat.index, yhat.np_values, ls="-", c="#0072B2", zorder=0, label=yhat_label)
+            ln = ax.plot(yhat.index, yhat.np_values, ls="-", c=self.yhat_color, zorder=0, label=yhat_label)
             lines.extend(ln)
 
         # Get & plot the uncertainty of the prediction (if applicable)
         iqr = self.get_yhat_iqr()
         if iqr is not None:
             lb, ub = iqr.univariates["lb"], iqr.univariates["ub"]
-            ax.fill_between(lb.index, lb.values, ub.values, color="#0072B2", alpha=0.2, zorder=2)
+            ax.fill_between(lb.index, lb.values, ub.values, color=self.yhat_color, alpha=0.2, zorder=2)
 
         # Plot anomaly scores if desired
         if self.anom is not None and self.y is not None:
@@ -255,7 +263,7 @@ class Figure:
         ax.set_xlabel("Time")
         ax.set_ylabel(metric_name)
         ax.set_title(title if title else metric_name)
-        ax.legend(lines, [l.get_label() for l in lines], loc="upper right")
+        fig.legend(lines, [l.get_label() for l in lines])
         fig.tight_layout()
         return fig, ax
 
@@ -276,8 +284,7 @@ class Figure:
         full_label_alias = copy(self._default_label_alias)
         full_label_alias.update(label_alias)
 
-        prediction_color = "#0072B2"
-        error_color = "rgba(0, 114, 178, 0.2)"  # '#0072B2' with 0.2 opacity
+        error_color = "rgba" + str(tuple(int(x * 255) for x in to_rgb(self.yhat_color)) + (0.2,))
         actual_color = "black"
         anom_color = "red"
         line_width = 2
@@ -309,7 +316,7 @@ class Figure:
                     x=yhat.index,
                     y=yhat.np_values,
                     mode="lines",
-                    line=dict(color=prediction_color, width=line_width),
+                    line=dict(color=self.yhat_color, width=line_width),
                     fillcolor=error_color,
                     fill=fill_mode,
                 )
@@ -403,6 +410,7 @@ class MTSFigure:
         yhat_prev: TimeSeries = None,
         yhat_prev_lb: TimeSeries = None,
         yhat_prev_ub: TimeSeries = None,
+        yhat_color: str = None,
     ):
         assert y is not None, "`y` must be given"
 
@@ -432,6 +440,7 @@ class MTSFigure:
         self.yhat_prev = yhat_prev
         self.yhat_prev_lb = yhat_prev_lb
         self.yhat_prev_ub = yhat_prev_ub
+        self.yhat_color = yhat_color if isinstance(yhat_color, str) else "#0072B2"
 
     @property
     def t0(self):
@@ -509,9 +518,8 @@ class MTSFigure:
         :param figsize: figure size in pixels
         :return: plotly figure.
         """
-        prediction_color = "#0072B2"
-        error_color = "rgba(0, 114, 178, 0.2)"  # '#0072B2' with 0.2 opacity
         anom_color = "red"
+        error_color = "rgba" + str(tuple(int(x * 255) for x in to_rgb(self.yhat_color)) + (0.2,))
 
         traces = []
         y = self.get_y()
@@ -540,7 +548,7 @@ class MTSFigure:
                         x=v.index,
                         y=v.np_values,
                         mode="lines",
-                        line=dict(color=prediction_color),
+                        line=dict(color=self.yhat_color),
                         fillcolor=error_color,
                         fill=fill_mode,
                     )

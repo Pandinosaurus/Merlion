@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -13,13 +13,13 @@ from typing import Any, Dict, List, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
 
 from merlion.models.base import ModelBase, Config
 from merlion.models.ensemble.combine import CombinerBase, CombinerFactory, Mean
 from merlion.models.factory import ModelFactory
 from merlion.utils import TimeSeries
 from merlion.utils.misc import AutodocABCMeta
+from merlion.utils.resample import to_offset
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,10 @@ class EnsembleConfig(Config):
             if self.models is None:
                 models = None
             else:
-                models = [None if m is None else dict(name=type(m).__name__, **m.config.to_dict()) for m in self.models]
+                models = [
+                    None if m is None else dict(name=type(m).__name__, **m.config.to_dict(_skipped_keys))
+                    for m in self.models
+                ]
             config_dict["models"] = models
         return config_dict
 
@@ -98,7 +101,6 @@ class EnsembleBase(ModelBase, metaclass=AutodocABCMeta):
     """
 
     config_class = EnsembleConfig
-    _default_train_config = EnsembleTrainConfig(valid_frac=0.0)
 
     def __init__(self, config: EnsembleConfig = None, models: List[ModelBase] = None):
         """
@@ -128,9 +130,14 @@ class EnsembleBase(ModelBase, metaclass=AutodocABCMeta):
         """
         return self.config.combiner
 
+    @property
+    def _default_train_config(self):
+        return EnsembleTrainConfig(valid_frac=0.0)
+
     def reset(self):
         for model in self.models:
             model.reset()
+        self.combiner.reset()
 
     @property
     def models_used(self):
@@ -139,49 +146,48 @@ class EnsembleBase(ModelBase, metaclass=AutodocABCMeta):
         else:
             return [True] * len(self.models)
 
+    @property
+    def _pandas_train(self):
+        return False
+
     def train_valid_split(
         self, transformed_train_data: TimeSeries, train_config: EnsembleTrainConfig
-    ) -> Tuple[TimeSeries, TimeSeries]:
+    ) -> Tuple[TimeSeries, Union[TimeSeries, None]]:
         valid_frac = train_config.valid_frac
         if valid_frac == 0 or not self.combiner.requires_training:
-            return transformed_train_data, transformed_train_data
+            return transformed_train_data, None
 
         t0 = transformed_train_data.t0
         tf = transformed_train_data.tf
 
         return transformed_train_data.bisect(t0 + (tf - t0) * (1 - valid_frac))
 
-    def get_max_common_horizon(self):
+    def get_max_common_horizon(self, train_data=None):
         horizons = []
         for model in self.models:
             dt = getattr(model, "timedelta", None)
             n = getattr(model, "max_forecast_steps", None)
-            if dt is not None and n is not None:
+            if train_data is not None and n is not None and dt is None:
                 try:
-                    h = pd.to_timedelta(dt * n, unit="s")
+                    model.train_pre_process(train_data)
                 except:
-                    h = to_offset(dt * n)
-                horizons.append(h)
+                    continue
+                dt = getattr(model, "timedelta", None)
+                n = getattr(model, "max_forecast_steps", None)
+            if dt is not None and n is not None:
+                horizons.append(to_offset(dt * n))
         if all(h is None for h in horizons):
             return None
         i = np.argmin([pd.to_datetime(0) + h for h in horizons if h is not None])
         return horizons[i]
 
-    def truncate_valid_data(self, transformed_valid_data: TimeSeries):
-        tf = transformed_valid_data.tf
-        max_model_tfs = [tf]
-        for model in self.models:
-            t0 = getattr(model, "last_train_time", None)
-            dt = getattr(model, "timedelta", None)
-            n = getattr(model, "max_forecast_steps", None)
-            if all(x is not None for x in [t0, dt, n]):
-                max_model_tfs.append(t0 + dt * n)
-
-        tf = min(max_model_tfs)
-        return transformed_valid_data.bisect(tf, t_in_left=True)[0]
-
-    def train_combiner(self, all_model_outs: List[TimeSeries], target: TimeSeries) -> TimeSeries:
-        return self.combiner.train(all_model_outs, target)
+    def train_combiner(self, all_model_outs: List[TimeSeries], target: TimeSeries, **kwargs) -> TimeSeries:
+        combined = self.combiner.train(all_model_outs, target, **kwargs)
+        if not any(self.models_used):
+            raise RuntimeError("None of the individual models in the ensemble is used! Check logs for errors.")
+        used = [f"#{i+1} ({type(m).__name__})" for i, (m, u) in enumerate(zip(self.models, self.models_used)) if u]
+        logger.info(f"Models used (of {len(self.models)}): {', '.join(used)}")
+        return combined
 
     def __getstate__(self):
         state = super().__getstate__()

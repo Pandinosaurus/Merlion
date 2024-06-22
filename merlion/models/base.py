@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -9,22 +9,23 @@ Contains the base classes for all models.
 """
 from abc import abstractmethod
 import copy
+from enum import Enum
 import json
 import logging
 import os
 from os.path import abspath, join
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import dill
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
 
 from merlion.transform.base import TransformBase, Identity
 from merlion.transform.factory import TransformFactory
 from merlion.transform.normalize import Rescale, MeanVarNormalize
 from merlion.transform.sequence import TransformSequence
-from merlion.utils.time_series import assert_equal_timedeltas, to_pd_datetime, TimeSeries
+from merlion.utils.time_series import assert_equal_timedeltas, to_pd_datetime, infer_granularity, TimeSeries
 from merlion.utils.misc import AutodocABCMeta, ModelConfigMeta
+from merlion.utils.resample import to_offset
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +54,6 @@ class Config(object, metaclass=ModelConfigMeta):
             self.transform = transform
         self.dim = None
 
-    @property
-    def base_model(self):
-        """
-        The base model of a base model is itself.
-        """
-        return self
-
     def to_dict(self, _skipped_keys=None):
         """
         :return: dict with keyword arguments used to initialize the config class.
@@ -71,6 +65,8 @@ class Config(object, metaclass=ModelConfigMeta):
             key = k_strip if hasattr(self, k_strip) else key
             if hasattr(value, "to_dict"):
                 value = value.to_dict()
+            elif isinstance(value, Enum):
+                value = value.name  # Relies on there being an appropriate getter/setter!
             if key not in skipped_keys:
                 config_dict[key] = copy.deepcopy(value)
         return config_dict
@@ -162,7 +158,6 @@ class ModelBase(metaclass=AutodocABCMeta):
 
     filename = "model.pkl"
     config_class = Config
-    _default_train_config = None
 
     train_data: Optional[TimeSeries] = None
     """
@@ -174,6 +169,7 @@ class ModelBase(metaclass=AutodocABCMeta):
         self.config = copy.copy(config)
         self.last_train_time = None
         self.timedelta = None
+        self.timedelta_offset = pd.to_timedelta(0)
         self.train_data = None
 
     def reset(self):
@@ -181,6 +177,45 @@ class ModelBase(metaclass=AutodocABCMeta):
         Resets the model's internal state.
         """
         self.__init__(self.config)
+
+    @property
+    def base_model(self):
+        """
+        The base model of a base model is itself.
+        """
+        return self
+
+    @property
+    @abstractmethod
+    def require_even_sampling(self) -> bool:
+        """
+        Whether the model assumes that training data is sampled at a fixed frequency
+        """
+
+    @property
+    @abstractmethod
+    def require_univariate(self) -> bool:
+        """
+        Whether the model only works with univariate time series.
+        """
+
+    @property
+    def auto_align(self) -> bool:
+        """
+        Whether to ensure that all univariates in the training data are aligned.
+        """
+        return True
+
+    @property
+    def _default_train_config(self):
+        return None
+
+    @property
+    def supports_exog(self):
+        """
+        Whether the model supports exogenous regressors.
+        """
+        return False
 
     def __getstate__(self):
         return {k: copy.deepcopy(v) for k, v in self.__dict__.items()}
@@ -225,10 +260,7 @@ class ModelBase(metaclass=AutodocABCMeta):
 
     @timedelta.setter
     def timedelta(self, timedelta):
-        try:
-            self._timedelta = pd.to_timedelta(timedelta, unit="s")
-        except:
-            self._timedelta = to_offset(timedelta)
+        self._timedelta = to_offset(timedelta)
 
     @property
     def last_train_time(self):
@@ -241,18 +273,18 @@ class ModelBase(metaclass=AutodocABCMeta):
     def last_train_time(self, last_train_time):
         self._last_train_time = to_pd_datetime(last_train_time)
 
-    def train_pre_process(
-        self, train_data: TimeSeries, require_even_sampling: bool, require_univariate: bool
-    ) -> TimeSeries:
+    @property
+    def _pandas_train(self):
+        """
+        Whether the _train() method requires ``pandas.DataFrame``. If False, we assume it accepts `TimeSeries`.
+        """
+        return True
+
+    def train_pre_process(self, train_data: TimeSeries) -> TimeSeries:
         """
         Applies pre-processing steps common for training most models.
 
         :param train_data: the original time series of training data
-        :param require_even_sampling: whether the model assumes that training
-            data is sampled at a fixed frequency
-        :param require_univariate: whether the model only works with univariate
-            time series
-
         :return: the training data, after any necessary pre-processing has been applied
         """
         self.train_data = train_data
@@ -260,37 +292,32 @@ class ModelBase(metaclass=AutodocABCMeta):
         self.transform.train(train_data)
         train_data = self.transform(train_data)
 
-        # Make sure the training data is univariate & all timestamps are equally
-        # spaced (this is a key assumption for ARIMA)
-        if require_univariate and train_data.dim != 1:
+        # Make sure the training data is univariate if needed
+        if self.require_univariate and train_data.dim != 1:
             raise RuntimeError(
                 f"Transform {self.transform} transforms data into a {train_data.dim}-"
                 f"variate time series, but model {type(self).__name__} can "
-                f"only handle uni-variate time series. Change the transform."
+                f"only handle uni-variate time series. Change the transform or set target_seq_index."
             )
 
+        # Make sure timestamps are equally spaced if needed (e.g. for ARIMA)
         t = train_data.time_stamps
-        if require_even_sampling:
-            assert_equal_timedeltas(train_data.univariates[train_data.names[0]])
+        self.timedelta, self.timedelta_offset = infer_granularity(t, return_offset=True)
+        if self.require_even_sampling:
+            assert_equal_timedeltas(train_data.univariates[train_data.names[0]], self.timedelta, self.timedelta_offset)
             assert train_data.is_aligned
-            self.timedelta = pd.infer_freq(to_pd_datetime(t))
-        else:
-            self.timedelta = t[1] - t[0]
         self.last_train_time = t[-1]
-        return train_data
+        return train_data.align() if self.auto_align else train_data
 
     def transform_time_series(
         self, time_series: TimeSeries, time_series_prev: TimeSeries = None
     ) -> Tuple[TimeSeries, Optional[TimeSeries]]:
         """
-        Applies the model's pre-processing transform to ``time_series`` and
-        ``time_series_prev``.
+        Applies the model's pre-processing transform to ``time_series`` and ``time_series_prev``.
 
         :param time_series: The time series
-        :param time_series_prev: A time series of context, immediately preceding
-            ``time_series``. Optional.
-
-        :return: The transformed ``time_series``.
+        :param time_series_prev: A time series of context, immediately preceding ``time_series``. Optional.
+        :return: The transformed ``time_series`` and ``time_series_prev``.
         """
         if time_series_prev is not None and not time_series.is_empty():
             t0 = time_series.t0
@@ -313,19 +340,25 @@ class ModelBase(metaclass=AutodocABCMeta):
         """
         raise NotImplementedError
 
+    @abstractmethod
+    def _train(self, train_data: pd.DataFrame, train_config=None):
+        raise NotImplementedError
+
+    @abstractmethod
+    def train_post_process(self, train_result):
+        raise NotImplementedError
+
     def _save_state(self, state_dict: Dict[str, Any], filename: str = None, **save_config) -> Dict[str, Any]:
         """
-        Saves the model's state to the the specified file. If you override this
-        method, please also override _load_state(). By default, the model's state
-        dict is just serialized using dill.
+        Saves the model's state to the the specified file. If you override this method, please also override
+        ``_load_state()``. By default, the model's state dict is just serialized using dill.
 
         :param state_dict: The state dict to save.
         :param filename: The name of the file to save the model to.
         :param save_config: additional configurations (if needed)
         :return: The state dict to save.
         """
-        if "config" in state_dict:  # don't save the config
-            state_dict.pop("config")
+        state_dict.pop("config", None)  # don't save the model's config in binary
         if filename is not None:
             with open(filename, "wb") as f:
                 dill.dump(state_dict, f)
@@ -339,8 +372,6 @@ class ModelBase(metaclass=AutodocABCMeta):
         """
         state_dict = self.__getstate__()
         config_dict = self.config.to_dict()
-        model_path = abspath(join(dirname, self.filename))
-        config_dict["model_path"] = model_path
 
         # create the directory if needed
         os.makedirs(dirname, exist_ok=True)
@@ -350,17 +381,15 @@ class ModelBase(metaclass=AutodocABCMeta):
             json.dump(config_dict, f, indent=2, sort_keys=True)
 
         # Save the model state
-        self._save_state(state_dict, model_path, **save_config)
+        self._save_state(state_dict, abspath(join(dirname, self.filename)), **save_config)
 
     def _load_state(self, state_dict: Dict[str, Any], **kwargs):
         """
-        Loads the model's state from the specified file. Override this method if
-        you have overridden _save_state(). By default, the model's state dict is
-        loaded from a file (serialized by dill), and the state is set.
+        Loads the model's state from the specified file. Override this method if you have overridden _save_state().
+        By default, the model's state dict is loaded from a file (serialized by dill), and the state is set.
 
         :param filename: serialized file containing the model's state.
-        :param kwargs: any additional keyword arguments to set manually in the
-            state dict (after loading it).
+        :param kwargs: any additional keyword arguments to set manually in the state dict (after loading it).
         """
         if "config" in state_dict:  # don't re-set the config
             state_dict.pop("config")
@@ -383,9 +412,8 @@ class ModelBase(metaclass=AutodocABCMeta):
         config_path = join(dirname, cls.config_class.filename)
         with open(config_path, "r") as f:
             config_dict = json.load(f)
-        model_path = config_dict.pop("model_path")
         # Load the state
-        state_dict = cls._load_state_dict(model_path)
+        state_dict = cls._load_state_dict(join(dirname, cls.filename))
 
         return cls._from_config_state_dicts(config_dict, state_dict, **kwargs)
 
@@ -445,3 +473,20 @@ class ModelBase(metaclass=AutodocABCMeta):
         state_dict.pop("config", None)
         new_model.__setstate__(state_dict)
         return new_model
+
+
+class MultipleTimeseriesModelMixin(metaclass=AutodocABCMeta):
+    """
+    Abstract mixin for models supporting training on multiple time series.
+    """
+
+    @abstractmethod
+    def train_multiple(self, multiple_train_data: List[TimeSeries], train_config=None):
+        """
+        Trains the model on multiple time series, optionally with some
+        additional implementation-specific config options ``train_config``.
+
+        :param multiple_train_data: a list of `TimeSeries` to use as a training set
+        :param train_config: additional configurations (if needed)
+        """
+        raise NotImplementedError

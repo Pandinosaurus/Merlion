@@ -1,4 +1,5 @@
 <div align="center">
+<img alt="Logo" src="https://github.com/salesforce/Merlion/raw/main/merlion_logo.svg" width="80%"/>
 </div>
 
 <div align="center">
@@ -20,6 +21,7 @@
 
 ## Table of Contents
 1. [Introduction](#introduction)
+1. [Comparison with Related Libraries](#comparison-with-related-libraries)
 1. [Installation](#installation)
 1. [Documentation](#documentation)
 1. [Getting Started](#getting-started)
@@ -38,33 +40,51 @@ across multiple time series datasets.
 
 Merlion's key features are
 -  Standardized and easily extensible data loading & benchmarking for a wide range of forecasting and anomaly
-   detection datasets.
--  A library of diverse models for both anomaly detection and forecasting, unified under a shared interface.
-   Models include classic statistical methods, tree ensembles, and deep
+   detection datasets. This includes transparent support for custom datasets.
+-  A library of diverse models for anomaly detection, forecasting, and change point detection, all
+   unified under a shared interface. Models include classic statistical methods, tree ensembles, and deep
    learning approaches. Advanced users may fully configure each model as desired.
 -  Abstract `DefaultDetector` and `DefaultForecaster` models that are efficient, robustly achieve good performance,
    and provide a starting point for new users.
 -  AutoML for automated hyperaparameter tuning and model selection.
+-  Unified API for using a wide range of models to forecast with
+   [exogenous regressors](https://opensource.salesforce.com/Merlion/tutorials/forecast/3_ForecastExogenous.html).
 -  Practical, industry-inspired post-processing rules for anomaly detectors that make anomaly scores more interpretable,
    while also reducing the number of false positives.
 -  Easy-to-use ensembles that combine the outputs of multiple models to achieve more robust performance. 
 -  Flexible evaluation pipelines that simulate the live deployment & re-training of a model in production,
    and evaluate performance on both forecasting and anomaly detection.
--  Native support for visualizing model predictions.
+-  Native support for visualizing model predictions, including with a clickable visual UI.
+-  Distributed computation [backend](https://opensource.salesforce.com/Merlion/merlion.spark.html) using PySpark,
+   which can be used to serve time series applications at industrial scale.
+
+
+## Comparison with Related Libraries
 
 The table below provides a visual overview of how Merlion's key features compare to other libraries for time series
 anomaly detection and/or forecasting.
 
-|                     | Merlion | Alibi Detect | Kats | statsmodels | GluonTS | RRCF | STUMPY | Greykite | Prophet | pmdarima 
-:---                  | :---:     | :---:|  :---:  | :---: | :---: | :---: | :---: | :---: | :----: | :---:
-| Univariate Forecasting | ✅      | | ✅    | ✅          | ✅       |      |      |✅        | ✅      | ✅ 
-| Multivariate Forecasting | ✅ | | ✅ | ✅ | ✅ | | | | | | 
-| Univariate Anomaly Detection | ✅ | ✅ | ✅ | | | ✅ | ✅ | ✅ | ✅ | 
-| Multivariate Anomaly Detection | ✅ | ✅ | ✅ | | | ✅ | ✅ | | | |
-| AutoML | ✅ | | ✅ | | | | | ✅ | | ✅ 
-| Ensembles | ✅ | | | | | ✅  | | | | 
-| Benchmarking | ✅ | | | | ✅ | | | | | 
-| Visualization | ✅ | | ✅ | | | | | ✅ | ✅ | | 
+|                     | Merlion | Prophet | Alibi Detect | Kats | darts | statsmodels | nixtla | GluonTS | RRCF | STUMPY | Greykite |pmdarima 
+:---                  | :---:     | :---:|  :---:  | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :----: | :---:
+| Univariate Forecasting | ✅ | ✅| | ✅ | ✅ | ✅ | ✅ | ✅ | | |✅| ✅ 
+| Multivariate Forecasting | ✅ | | | ✅ | ✅ | ✅| ✅ | ✅ | | | | |
+| Univariate Anomaly Detection | ✅ | ✅ | ✅ | ✅ | ✅ | | | | ✅ | ✅ | ✅ | ✅ | 
+| Multivariate Anomaly Detection | ✅ | | ✅ | ✅ | ✅ | | | | ✅ | ✅ | | | |
+| Pre Processing | ✅ | | ✅ | ✅ | ✅ | | ✅ | ✅ | | | ✅ | ✅
+| Post Processing | ✅ | | ✅ | | | | | | | | | |
+| AutoML | ✅ | | | ✅ | | | | | | | | ✅ | | ✅ 
+| Ensembles | ✅ | | | ✅ | ✅ | | | | | ✅ | | | | 
+| Benchmarking | ✅ | | | | ✅ | ✅ | ✅ | | | | ✅ | 
+| Visualization | ✅ | ✅ | | ✅ | ✅ | | | | | | ✅ | 
+
+The following features are new in Merlion 2.0:
+
+|                     | Merlion | Prophet | Alibi Detect | Kats | darts | statsmodels | nixtla | GluonTS | RRCF | STUMPY | Greykite |pmdarima 
+:---                  | :---:     | :---:|  :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :----: | :---:
+| Exogenous Regressors   | ✅ | ✅ | | |✅ | ✅ |  | | | | ✅ | ✅
+| Change Point Detection | ✅ | ✅ | ✅ | ✅ | | | | | | | ✅ |
+| Clickable Visual UI    | ✅ | | | | | | | | | | |
+| Distributed Backend    | ✅ | | | | | | ✅ | | | | | 
 
 ## Installation
 
@@ -74,8 +94,10 @@ time series as ``pandas.DataFrame`` s with accompanying metadata.
 
 You can install `merlion` from PyPI by calling ``pip install salesforce-merlion``. You may install from source by
 cloning this repoand calling ``pip install Merlion/``, or ``pip install -e Merlion/`` to install in editable mode.
-You may install additional dependencies for plotting & visualization via ``pip install salesforce-merlion[plot]``,
-or by calling ``pip install "Merlion/[plot]"`` if installing from source.
+You may install additional dependencies via ``pip install salesforce-merlion[all]``,  or by calling
+``pip install "Merlion/[all]"`` if installing from source. 
+Individually, the optional dependencies include ``dashboard`` for a GUI dashboard,
+``spark`` for a distributed computation backend with PySpark, and ``deep-learning`` for all deep learning models.
 
 To install the data loading package `ts_datasets`, clone this repo and call ``pip install -e Merlion/ts_datasets/``.
 This package must be installed in editable mode (i.e. with the ``-e`` flag) if you don't want to manually specify the
@@ -90,7 +112,8 @@ Note the following external dependencies:
 
 2. Some of our anomaly detection models depend on the Java Development Kit (JDK). For Ubuntu, call
    ``sudo apt-get install openjdk-11-jdk``. For Mac OS, install [Homebrew](<https://brew.sh/>) and call
-   ``brew tap adoptopenjdk/openjdk && brew install --cask adoptopenjdk11``.
+   ``brew tap adoptopenjdk/openjdk && brew install --cask adoptopenjdk11``. Also ensure that ``java`` can be found
+   on your ``PATH``, and that the ``JAVA_HOME`` environment variable is set.
 
 ## Documentation
 
@@ -103,10 +126,23 @@ and presents experimental results on time series anomaly detection & forecasting
 time series.
 
 ## Getting Started
-Here, we provide some minimal examples using Merlion default models, 
-to help you get started with both anomaly detection and forecasting.
+The easiest way to get started is to use the GUI web-based
+[dashboard](https://opensource.salesforce.com/Merlion/merlion.dashboard.html).
+This dashboard provides a great way to quickly experiment with many models on your own custom datasets.
+To use it, install Merlion with the optional ``dashboard`` dependency (i.e.
+``pip install salesforce-merlion[dashboard]``), and call ``python -m merlion.dashboard`` from the command line.
+You can view the dashboard at http://localhost:8050.
+Below, we show some screenshots of the dashboard for both anomaly detection and forecasting.
+
+![anomaly dashboard](https://github.com/salesforce/Merlion/raw/main/figures/dashboard_anomaly.png)
+
+![forecast dashboard](https://github.com/salesforce/Merlion/raw/main/figures/dashboard_forecast.png)
+
+To help you get started with using Merlion in your own code, we provide below some minimal examples using Merlion
+default models for both anomaly detection and forecasting.
 
 ### Anomaly Detection
+Here, we show the code to replicate the results from the anomaly detection dashboard above.
 We begin by importing Merlion’s `TimeSeries` class and the data loader for the Numenta Anomaly Benchmark `NAB`.
 We can then divide a specific time series from this dataset into training and testing splits.
 
@@ -157,9 +193,10 @@ print(f"Precision: {p:.4f}, Recall: {r:.4f}, F1: {f1:.4f}\n"
 ```
 ```
 Precision: 0.6667, Recall: 0.6667, F1: 0.6667
-Mean Time To Detect: 1 days 10:30:00
+Mean Time To Detect: 1 days 10:22:30
 ```
 ### Forecasting
+Here, we show the code to replicate the results from the forecasting dashboard above.
 We begin by importing Merlion’s `TimeSeries` class and the data loader for the `M4` dataset. We can then divide a
 specific time series from this dataset into training and testing splits.
 
@@ -211,7 +248,7 @@ msis = ForecastMetric.MSIS.value(ground_truth=test_data, predict=test_pred,
 print(f"sMAPE: {smape:.4f}, MSIS: {msis:.4f}")
 ```
 ```
-sMAPE: 6.2855, MSIS: 19.1584
+sMAPE: 4.1944, MSIS: 18.9331
 ```
 
 ## Evaluation and Benchmarking
@@ -262,3 +299,7 @@ If you're using Merlion in your research or applications, please cite using this
       primaryClass={cs.LG}
 }
 ```
+
+## To Dos
+We are striving to leverage the time-series modeling with GPUs to further improve the speed and throughput of Merlion. 
+Stay tuned ...

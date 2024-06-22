@@ -8,7 +8,8 @@ Basics
    :maxdepth: 2
    :glob:
 
-   examples/TimeSeries.ipynb
+   tutorials/TimeSeries.ipynb
+   tutorials/CustomDataset.ipynb
 
 Anomaly Detection
 -----------------
@@ -16,7 +17,7 @@ Anomaly Detection
    :maxdepth: 2
    :glob:
 
-   examples/anomaly/*
+   tutorials/anomaly/*
 
 Forecasting
 -----------
@@ -24,7 +25,7 @@ Forecasting
    :maxdepth: 2
    :glob:
 
-   examples/forecast/*
+   tutorials/forecast/*
 
 Advanced Features
 -----------------
@@ -32,4 +33,4 @@ Advanced Features
    :maxdepth: 2
    :glob:
 
-   examples/advanced/*
+   tutorials/advanced/*

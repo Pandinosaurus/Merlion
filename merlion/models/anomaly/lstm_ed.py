@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,17 +7,27 @@
 """
 The LSTM-encoder-decoder-based anomaly detector for multivariate time series
 """
-import numpy as np
-import torch
-import torch.nn as nn
 from typing import Sequence
-from torch.utils.data import DataLoader
-from merlion.utils import UnivariateTimeSeries, TimeSeries
+
+import numpy as np
+import pandas as pd
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+except ImportError as e:
+    err = (
+        "Try installing Merlion with optional dependencies using `pip install salesforce-merlion[deep-learning]` or "
+        "`pip install `salesforce-merlion[all]`"
+    )
+    raise ImportError(str(e) + ". " + err)
+
 from merlion.models.base import NormalizingConfig
 from merlion.models.anomaly.base import DetectorBase, DetectorConfig
 from merlion.post_process.threshold import AggregateAlarms
 from merlion.utils.misc import ProgressBar, initializer
-from merlion.models.anomaly.utils import InputData, batch_detect
+from merlion.models.utils.rolling_window_dataset import RollingWindowDataset
 
 
 class LSTMEDConfig(DetectorConfig, NormalizingConfig):
@@ -83,19 +93,29 @@ class LSTMED(DetectorBase):
         self.lstmed = None
         self.data_dim = None
 
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
+
+    @property
+    def require_univariate(self) -> bool:
+        return False
+
     def _build_model(self, dim):
         return LSTMEDModule(dim, self.hidden_size, self.n_layers, self.dropout, self.device)
 
-    def _train(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
-        train_x = InputData(X, k=self.sequence_length)
-        train_loader = DataLoader(
-            dataset=train_x, batch_size=self.batch_size, shuffle=True, collate_fn=InputData.collate_func
+    def _train(self, train_data: pd.DataFrame, train_config=None) -> pd.DataFrame:
+        train_loader = RollingWindowDataset(
+            train_data,
+            target_seq_index=None,
+            shuffle=True,
+            flatten=False,
+            n_past=self.sequence_length,
+            n_future=0,
+            batch_size=self.batch_size,
         )
-        self.data_dim = X.shape[1]
-        self.lstmed = self._build_model(X.shape[1]).to(self.device)
+        self.data_dim = train_data.shape[1]
+        self.lstmed = self._build_model(train_data.shape[1]).to(self.device)
         optimizer = torch.optim.Adam(self.lstmed.parameters(), lr=self.lr)
         loss_func = torch.nn.MSELoss(reduction="sum")
         bar = ProgressBar(total=self.num_epochs)
@@ -103,84 +123,44 @@ class LSTMED(DetectorBase):
         self.lstmed.train()
         for epoch in range(self.num_epochs):
             total_loss = 0
-            for batch in train_loader:
-                batch = batch.to(self.device)
+            for batch, _, _, _ in train_loader:
+                batch = torch.tensor(batch, dtype=torch.float, device=self.device)
                 output = self.lstmed(batch)
-                loss = loss_func(output, batch.float())
+                loss = loss_func(output, batch)
                 self.lstmed.zero_grad()
                 loss.backward()
                 optimizer.step()
                 total_loss += loss
             if bar is not None:
                 bar.print(epoch + 1, prefix="", suffix="Complete, Loss {:.4f}".format(total_loss / len(train_loader)))
+        return self._get_anomaly_score(train_data)
 
-    def _detect(self, X):
-        """
-        :param X: The input time series, a numpy array.
-        """
-        data_loader = DataLoader(
-            dataset=InputData(X, k=self.sequence_length), batch_size=self.batch_size, shuffle=False
-        )
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
         self.lstmed.eval()
+        ts = pd.concat((time_series_prev, time_series)) if time_series_prev is None else time_series
+        data_loader = RollingWindowDataset(
+            ts,
+            target_seq_index=None,
+            shuffle=False,
+            flatten=False,
+            n_past=self.sequence_length,
+            n_future=0,
+            batch_size=self.batch_size,
+        )
         scores, outputs = [], []
-        for idx, batch in enumerate(data_loader):
-            batch = batch.to(self.device)
+        for idx, (batch, _, _, _) in enumerate(data_loader):
+            batch = torch.tensor(batch, dtype=torch.float, device=self.device)
             output = self.lstmed(batch)
-            error = nn.L1Loss(reduction="none")(output, batch.float())
-            score = np.mean(error.view(-1, X.shape[1]).data.cpu().numpy(), axis=1)
+            error = nn.L1Loss(reduction="none")(output, batch)
+            score = np.mean(error.view(-1, ts.shape[1]).data.cpu().numpy(), axis=1)
             scores.append(score.reshape(batch.shape[0], self.sequence_length))
 
         scores = np.concatenate(scores)
-        lattice = np.full((self.sequence_length, X.shape[0]), np.nan)
+        lattice = np.full((self.sequence_length, ts.shape[0]), np.nan)
         for i, score in enumerate(scores):
             lattice[i % self.sequence_length, i : i + self.sequence_length] = score
         scores = np.nanmean(lattice, axis=0)
-        return scores
-
-    def _get_sequence_len(self):
-        return self.sequence_length
-
-    def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
-    ) -> TimeSeries:
-        """
-        Train a multivariate time series anomaly detector.
-
-        :param train_data: A `TimeSeries` of metric values to train the model.
-        :param anomaly_labels: A `TimeSeries` indicating which timestamps are
-            anomalous. Optional.
-        :param train_config: Additional training configs, if needed. Only
-            required for some models.
-        :param post_rule_train_config: The config to use for training the
-            model's post-rule. The model's default post-rule train config is
-            used if none is supplied here.
-
-        :return: A `TimeSeries` of the model's anomaly scores on the training
-            data.
-        """
-        train_data = self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
-
-        train_df = train_data.align().to_pd()
-        self._train(train_df.values)
-        scores = batch_detect(self, train_df.values)
-
-        train_scores = TimeSeries({"anom_score": UnivariateTimeSeries(train_data.time_stamps, scores)})
-        self.train_post_rule(
-            anomaly_scores=train_scores, anomaly_labels=anomaly_labels, post_rule_train_config=post_rule_train_config
-        )
-        return train_scores
-
-    def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
-        """
-        :param time_series: The `TimeSeries` we wish to predict anomaly scores for.
-        :param time_series_prev: A `TimeSeries` immediately preceding ``time_series``.
-        :return: A univariate `TimeSeries` of anomaly scores
-        """
-        time_series, time_series_prev = self.transform_time_series(time_series, time_series_prev)
-        ts = time_series_prev + time_series if time_series_prev is not None else time_series
-        scores = batch_detect(self, ts.align().to_pd().values)
-        timestamps = time_series.time_stamps
-        return TimeSeries({"anom_score": UnivariateTimeSeries(timestamps, scores[-len(timestamps) :])})
+        return pd.DataFrame(scores[-len(time_series) :], index=time_series.index)
 
 
 class LSTMEDModule(nn.Module):

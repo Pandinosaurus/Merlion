@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -19,11 +19,12 @@ import_alias = dict(
     ExponentialMovingAverage="merlion.transform.moving_average:ExponentialMovingAverage",
     DifferenceTransform="merlion.transform.moving_average:DifferenceTransform",
     LagTransform="merlion.transform.moving_average:LagTransform",
+    LowerUpperClip="merlion.transform.bound:LowerUpperClip",
     Rescale="merlion.transform.normalize:Rescale",
     AbsVal="merlion.transform.normalize:AbsVal",
     MeanVarNormalize="merlion.transform.normalize:MeanVarNormalize",
     MinMaxNormalize="merlion.transform.normalize:MinMaxNormalize",
-    PowerTransform="merlion.transform.normalize:PowerTransform",
+    BoxCoxTransform="merlion.transform.normalize:BoxCoxTransform",
     TemporalResample="merlion.transform.resample:TemporalResample",
     Shingle="merlion.transform.resample:Shingle",
     TransformSequence="merlion.transform.sequence:TransformSequence",

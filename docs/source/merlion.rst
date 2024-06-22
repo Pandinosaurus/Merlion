@@ -6,15 +6,22 @@ each associated with its own sub-package:
 -   :py:mod:`merlion.models`: A library of models unified under a single shared interface, with specializations
     for anomaly detection and forecasting. More specifically, we have
 
+    -   :py:mod:`merlion.models.defaults`: Default models for anomaly detection and forecasting. These are good models
+        for getting started.
     -   :py:mod:`merlion.models.anomaly`: Anomaly detection models
     -   :py:mod:`merlion.models.anomaly.change_point`: Change point detection models
-    -   :py:mod:`merlion.models.forecast`: Forecasting models
+    -   :py:mod:`merlion.models.forecast`: Forecasting models, including those which support exogenous regressors
     -   :py:mod:`merlion.models.anomaly.forecast_based`: Forecasting models adapted for anomaly detection. Anomaly
         scores are based on the residual between the predicted and true value at each timestamp.
     -   :py:mod:`merlion.models.ensemble`: Ensembles & automated model selection of models for both anomaly
         detection and forecasting.
     -   :py:mod:`merlion.models.automl`: AutoML layers for various models
 
+-   :py:mod:`merlion.dashboard`: A GUI dashboard app for Merlion, which can be started with
+    ``python -m merlion.dashboard``. This dashboard provides a good way to quickly experiment many models on a new
+    time series.
+-   :py:mod:`merlion.spark`: APIs to integrate Merlion with PySpark for using distributed computing to run training
+    and inference on multiple time series in parallel.
 -   :py:mod:`merlion.transform`: Data pre-processing layer which implements many standard data transformations used in
     time series analysis. Transforms are callable objects, and each model has its own configurable ``model.transform``
     which it uses to pre-process all input time series for both training and inference.
@@ -31,38 +38,41 @@ each associated with its own sub-package:
 -   :py:mod:`merlion.evaluate`: Evaluation metrics & pipelines to simulate the live deployment of a time series model
     for any task.
 -   :py:mod:`merlion.plot`: Automated visualization of model outputs for univariate time series
+-   :py:mod:`merlion.utils`: Various utilities, including the `TimeSeries` class, resampling functions,
+    Bayesian conjugate priors, reconciliation for hierarchical time series, and more.
 
 The key classes for input and output are `merlion.utils.time_series.TimeSeries` and
 `merlion.utils.time_series.UnivariateTimeSeries`. Notably, these classes have transparent inter-operability
-with ``pandas.DataFrame`` and ``pandas.Series``, respectively. Check this `tutorial <examples/TimeSeries>`
+with ``pandas.DataFrame`` and ``pandas.Series``, respectively. Check this `tutorial <tutorials/TimeSeries>`
 for some examples on how to use these classes, or the API docs linked above for a full list of features.
+
+The full API documentation is outlined below:
 
 .. automodule:: merlion
    :members:
    :undoc-members:
    :show-inheritance:
 
-Subpackages
------------
-
 .. toctree::
-   :maxdepth: 4
+   :maxdepth: 3
 
    merlion.models
+   merlion.dashboard
+   merlion.spark
    merlion.transform
+
+.. toctree::
+   :maxdepth: 2
+
    merlion.post_process
    merlion.evaluate
+
+.. toctree::
+   :maxdepth: 1
+
+   merlion.plot
+
+.. toctree::
+   :maxdepth: 2
+
    merlion.utils
-
-Submodules
-----------
-
-.. _merlion.plot:
-
-merlion.plot module
--------------------
-
-.. automodule:: merlion.plot
-   :members:
-   :undoc-members:
-   :show-inheritance:

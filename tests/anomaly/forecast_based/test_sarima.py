@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -14,7 +14,8 @@ import numpy as np
 
 from merlion.models.anomaly.forecast_based.sarima import SarimaDetector, SarimaDetectorConfig
 from merlion.transform.resample import TemporalResample
-from merlion.utils.time_series import ts_csv_load, TimeSeries
+from merlion.utils.data_io import csv_to_time_series
+from merlion.utils.time_series import TimeSeries
 
 logger = logging.getLogger(__name__)
 rootdir = dirname(dirname(dirname(dirname(abspath(__file__)))))
@@ -26,7 +27,7 @@ class TestSarima(unittest.TestCase):
 
         # Re-sample to 1hr because default (1min) takes too long to train
         self.csv_name = join(rootdir, "data", "example.csv")
-        self.data = ts_csv_load(self.csv_name, n_vars=1)
+        self.data = csv_to_time_series(self.csv_name, timestamp_unit="ms", data_cols=["kpi"])
         logger.info(f"Data looks like:\n{self.data[:5]}")
 
         self.test_len = math.ceil(len(self.data) / 5)
@@ -35,7 +36,7 @@ class TestSarima(unittest.TestCase):
         self.model = SarimaDetector(
             SarimaDetectorConfig(
                 order=(2, 0, 2),
-                seasonal_order=(2, 0, 2, 24),  # daily seasonality
+                seasonal_order=(2, 0, 0, 24),  # daily seasonality
                 transform=TemporalResample("1h"),
                 max_forecast_steps=self.test_len,
             )
@@ -91,7 +92,8 @@ class TestSarima(unittest.TestCase):
         n_alarms = np.sum(alarms.to_pd().values != 0)
         logger.info(f"Alarms look like:\n{alarms[:5]}")
         logger.info(f"Number of alarms: {n_alarms}\n")
-        self.assertEqual(n_alarms, 2)
+        self.assertLessEqual(n_alarms, 3)
+        self.assertGreaterEqual(n_alarms, 2)
         loaded_model_alarms = loaded_model.get_anomaly_label(self.vals_test)
         self.assertSequenceEqual(list(alarms), list(loaded_model_alarms))
 

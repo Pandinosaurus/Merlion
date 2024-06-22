@@ -1,36 +1,41 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
 #
+"""
+Implementation of `TimeSeries` class.
+"""
 from bisect import bisect_left, bisect_right
 import itertools
 import logging
-from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
 import pandas as pd
-from pandas.tseries.frequencies import to_offset
 
 from merlion.utils.misc import ValIterOrderedDict
 from merlion.utils.resample import (
     AggregationPolicy,
     AlignPolicy,
     MissingValuePolicy,
+    get_date_offset,
     infer_granularity,
     reindex_df,
     to_pd_datetime,
     to_timestamp,
+    to_offset,
 )
 
 logger = logging.getLogger(__name__)
+_time_col_name = "time"
 
 
 class UnivariateTimeSeries(pd.Series):
     """
-    Please read the `tutorial <examples/TimeSeries>` before reading this API doc.
+    Please read the `tutorial <tutorials/TimeSeries>` before reading this API doc.
     This class is a time-indexed ``pd.Series`` which represents a univariate
     time series. For the most part, it supports all the same features as
     ``pd.Series``, with the following key differences to iteration and indexing:
@@ -95,14 +100,13 @@ class UnivariateTimeSeries(pd.Series):
             name = values.name
         if is_pd and isinstance(values.index, pd.DatetimeIndex):
             super().__init__(values, name=name)
+        elif is_pd and values.index.dtype == "O":
+            super().__init__(values.values, name=name, index=pd.to_datetime(values.index))
         else:
             if time_stamps is None:
-                if isinstance(freq, (int, float)):
-                    freq = pd.to_timedelta(freq, unit="s")
-                else:
-                    freq = to_offset(freq)
+                freq = to_offset(freq)
                 if is_pd and values.index.dtype in ("int64", "float64"):
-                    index = values.index.values * freq + np.full(len(values), pd.to_datetime(0))
+                    index = pd.to_datetime(0) + freq * values.index
                 else:
                     index = pd.date_range(start=0, periods=len(values), freq=freq)
             else:
@@ -110,6 +114,7 @@ class UnivariateTimeSeries(pd.Series):
             super().__init__(np.asarray(values), index=index, name=name, dtype=float)
             if len(self) >= 3 and self.index.freq is None:
                 self.index.freq = pd.infer_freq(self.index)
+            self.index.name = _time_col_name
 
     @property
     def np_time_stamps(self):
@@ -168,8 +173,7 @@ class UnivariateTimeSeries(pd.Series):
 
     def __iter__(self):
         """
-        The i'th item in the iterator is the tuple
-        ``(self.time_stamps[i], self.values[i])``.
+        The i'th item in the iterator is the tuple ``(self.time_stamps[i], self.values[i])``.
         """
         return itertools.starmap(lambda t, x: (t.item(), x.item()), zip(self.np_time_stamps, self.np_values))
 
@@ -279,29 +283,39 @@ class UnivariateTimeSeries(pd.Series):
         return pd.Series(self.np_values, index=self.index, name=self.name)
 
     @classmethod
-    def from_pd(cls, series: pd.Series, name=None, freq="1h"):
+    def from_pd(cls, series: Union[pd.Series, pd.DataFrame], name=None, freq="1h"):
         """
-        :param series: a ``pd.Series``. If it has a``pd.DatetimeIndex``, we will
-            use that index for the timestamps. Otherwise, we will create one at
-            the specified frequency.
+        :param series: a ``pd.Series``. If it has a``pd.DatetimeIndex``, we will use that index for the timestamps.
+            Otherwise, we will create one at the specified frequency.
         :param name: the name to assign the output
-        :param freq: if ``series`` is not indexed by time, this is the frequency
-            at which we will assume it is sampled.
+        :param freq: if ``series`` is not indexed by time, this is the frequency at which we will assume it is sampled.
 
         :rtype: UnivariateTimeSeries
         :return: the `UnivariateTimeSeries` represented by series.
         """
+        if series is None:
+            return None
+        if isinstance(series, TimeSeries) and series.dim == 1:
+            series = list(series.univariates)[0]
+        if isinstance(series, UnivariateTimeSeries):
+            if name is not None:
+                series.name = name
+            return series
+        if isinstance(series, pd.DataFrame) and series.shape[1] == 1:
+            series = series.iloc[:, 0]
         return cls(time_stamps=None, values=series.astype(float), name=name, freq=freq)
 
-    def to_ts(self):
+    def to_ts(self, name=None):
         """
+        :name: a name to assign the univariate when converting it to a time series. Can override the existing name.
         :rtype: TimeSeries
         :return: A `TimeSeries` representing this univariate time series.
         """
-        if self.name is None:
+        if self.name is None and name is None:
             return TimeSeries([self])
         else:
-            return TimeSeries({self.name: self})
+            name = name if self.name is None else self.name
+            return TimeSeries({name: self})
 
     @classmethod
     def empty(cls, name=None):
@@ -314,7 +328,7 @@ class UnivariateTimeSeries(pd.Series):
 
 class TimeSeries:
     """
-    Please read the `tutorial <examples/TimeSeries>` before reading this API doc.
+    Please read the `tutorial <tutorials/TimeSeries>` before reading this API doc.
     This class represents a general multivariate time series as a wrapper around
     a number of (optionally named) `UnivariateTimeSeries`. A `TimeSeries` object
     is initialized as ``time_series = TimeSeries(univariates)``, where
@@ -326,8 +340,7 @@ class TimeSeries:
     is *aligned* if all of its univariates have observations sampled at the exact
     set set of times.
 
-    One may access the `UnivariateTimeSeries` comprising this `TimeSeries` in
-    four ways:
+    One may access the `UnivariateTimeSeries` comprising this `TimeSeries` in four ways:
 
     1.  Iterate over the individual univariates using
 
@@ -408,27 +421,25 @@ class TimeSeries:
         self,
         univariates: Union[Mapping[Any, UnivariateTimeSeries], Iterable[UnivariateTimeSeries]],
         *,
+        freq: str = "1h",
         check_aligned=True,
     ):
         # Type/length checking of univariates
         if isinstance(univariates, Mapping):
-            if not isinstance(univariates, ValIterOrderedDict):
-                univariates = ValIterOrderedDict(univariates.items())
+            univariates = ValIterOrderedDict((str(k), v) for k, v in univariates.items())
             assert all(isinstance(var, UnivariateTimeSeries) for var in univariates.values())
         elif isinstance(univariates, Iterable):
             univariates = list(univariates)
             assert all(isinstance(var, UnivariateTimeSeries) for var in univariates)
-
-            names = [var.name for var in univariates]
+            names = [str(var.name) for var in univariates]
             if len(set(names)) == len(names):
-                names = [i if name is None else name for i, name in enumerate(names)]
+                names = [str(i) if name is None else name for i, name in enumerate(names)]
                 univariates = ValIterOrderedDict(zip(names, univariates))
             else:
-                univariates = ValIterOrderedDict(enumerate(univariates))
+                univariates = ValIterOrderedDict((str(i), v) for i, v in enumerate(univariates))
         else:
             raise TypeError(
-                "Expected univariates to be either a "
-                "`Sequence[UnivariateTimeSeries]` or a "
+                "Expected univariates to be either a `Sequence[UnivariateTimeSeries]` or a "
                 "`Mapping[Hashable, UnivariateTimeSeries]`."
             )
         assert len(univariates) > 0
@@ -489,13 +500,29 @@ class TimeSeries:
         """
         return len(self.univariates)
 
+    def rename(self, mapper: Union[Iterable[str], Mapping[str, str], Callable[[str], str]]):
+        """
+        :param mapper: Dict-like or function transformations to apply to the univariate names. Can also be an iterable
+             of new univariate names.
+        :return: the time series with renamed univariates.
+        """
+        if isinstance(mapper, Callable):
+            mapper = [mapper(old) for old in self.names]
+        elif isinstance(mapper, Mapping):
+            mapper = [mapper.get(old, old) for old in self.names]
+        univariates = ValIterOrderedDict((new_name, var) for new_name, var in zip(mapper, self.univariates))
+        return self.__class__(univariates)
+
     @property
     def is_aligned(self) -> bool:
         """
-        :return: Whether all individual variable time series are sampled at the
-            same time stamps, i.e. they are aligned.
+        :return: Whether all individual variable time series are sampled at the same time stamps, i.e. they are aligned.
         """
         return self._is_aligned
+
+    @property
+    def index(self):
+        return to_pd_datetime(self.np_time_stamps)
 
     @property
     def np_time_stamps(self):
@@ -550,7 +577,6 @@ class TimeSeries:
                 "(they have different time stamps), but alignment is required "
                 "to iterate over the time series."
             )
-
         return map(self._txs_to_vec, zip(*self.univariates))
 
     def __getitem__(self, i: Union[int, slice]):
@@ -596,8 +622,7 @@ class TimeSeries:
 
     def squeeze(self) -> UnivariateTimeSeries:
         """
-        :return: a `UnivariateTimeSeries` if the time series only
-            has one univariate, otherwise returns itself, a `TimeSeries`
+        :return: `UnivariateTimeSeries` if the time series is univariate; otherwise returns itself, a `TimeSeries`
         """
         if self.dim == 1:
             return self.univariates[self.names[0]]
@@ -633,22 +658,35 @@ class TimeSeries:
         :rtype: TimeSeries
         :return: concatenated time series
         """
-        assert (
-            self.dim == other.dim
-        ), f"Cannot concatenate a {self.dim}-dimensional time series with a {other.dim}-dimensional time series."
-        assert self.names == other.names, (
-            f"Cannot concatenate time series with two different sets of "
-            f"variable names, {self.names} and {other.names}."
-        )
+        return self.concat(other, axis=0)
 
-        # The output time series is aligned if and only if both time series
-        # are aligned, so skip the expensive check
-        univariates = ValIterOrderedDict(
-            [(name, ts0.concat(ts1)) for (name, ts0), ts1 in zip(self.items(), other.univariates)]
-        )
-        ret = TimeSeries(univariates, check_aligned=False)
-        ret._is_aligned = self.is_aligned and other.is_aligned
-        return ret
+    def concat(self, other, axis=0):
+        """
+        Concatenates the `TimeSeries` ``other`` on the time axis if ``axis = 0`` or the variable axis if ``axis = 1``.
+        :rtype: TimeSeries
+        :return: concatenated time series
+        """
+        assert axis in [0, 1]
+        if axis == 0:
+            assert self.dim == other.dim, (
+                f"Cannot concatenate a {self.dim}-dimensional time series with a {other.dim}-dimensional "
+                f"time series on the time axis."
+            )
+            assert self.names == other.names, (
+                f"Cannot concatenate time series on the time axis if they have two different sets of "
+                f"variable names, {self.names} and {other.names}."
+            )
+            univariates = ValIterOrderedDict(
+                [(name, ts0.concat(ts1)) for (name, ts0), ts1 in zip(self.items(), other.univariates)]
+            )
+            ret = TimeSeries(univariates, check_aligned=False)
+            ret._is_aligned = self.is_aligned and other.is_aligned
+            return ret
+        else:
+            univariates = ValIterOrderedDict([(name, var.copy()) for name, var in [*self.items(), other.items()]])
+            ret = TimeSeries(univariates, check_aligned=False)
+            ret._is_aligned = self.is_aligned and other.is_aligned and self.time_stamps == other.time_stamps
+            return ret
 
     def __eq__(self, other):
         if self.dim != other.dim:
@@ -660,13 +698,11 @@ class TimeSeries:
 
     def bisect(self, t: float, t_in_left: bool = False):
         """
-        Splits the time series at the point where the given timestap ``t`` occurs.
+        Splits the time series at the point where the given timestamp ``t`` occurs.
 
-        :param t: a Unix timestamp or datetime object. Everything before time
-            ``t`` is in the left split, and everything after time ``t`` is in
-            the right split.
-        :param t_in_left: if ``True``, ``t`` is in the left split. Otherwise,
-            ``t`` is in the right split.
+        :param t: a Unix timestamp or datetime object. Everything before time ``t`` is in the left split,
+            and everything after time ``t`` is in the right split.
+        :param t_in_left: if ``True``, ``t`` is in the left split. Otherwise, ``t`` is in the right split.
 
         :rtype: Tuple[TimeSeries, TimeSeries]
         :return: the left and right splits of the time series.
@@ -690,9 +726,8 @@ class TimeSeries:
             if ``include_tf`` is ``True``, non-inclusive otherwise)
         :param include_tf: Whether to include ``tf`` in the window.
 
-        :return: The subset of the time series occurring between timestamps
-            ``t0`` (inclusive) and ``tf`` (included if ``include_tf`` is
-            ``True``, excluded otherwise).
+        :return: The subset of the time series occurring between timestamps ``t0`` (inclusive) and ``tf``
+            (included if ``include_tf`` is ``True``, excluded otherwise).
         :rtype: `TimeSeries`
         """
         return TimeSeries(ValIterOrderedDict([(k, var.window(t0, tf, include_tf)) for k, var in self.items()]))
@@ -709,30 +744,42 @@ class TimeSeries:
         for _, var in univariates:
             t = t.union(var.index)
         t = t.sort_values()
+        t.name = _time_col_name
+        if len(t) >= 3:
+            t.freq = pd.infer_freq(t)
         df = pd.DataFrame(np.full((len(t), len(univariates)), np.nan), index=t, columns=self.names)
         for name, var in univariates:
             df.loc[var.index, name] = var[~var.index.duplicated()]
         return df
 
+    def to_csv(self, file_name, **kwargs):
+        self.to_pd().to_csv(file_name, **kwargs)
+
     @classmethod
-    def from_pd(cls, df: Union[pd.Series, pd.DataFrame, np.ndarray], check_times=True, freq="1h"):
+    def from_pd(cls, df: Union[pd.Series, pd.DataFrame, np.ndarray], check_times=True, drop_nan=True, freq="1h"):
         """
-        :param df: A pandas DataFrame with a DatetimeIndex. Each column
-            corresponds to a different variable of the time series, and the
-            key of column (in sorted order) give the relative order of those
-            variables (in the list self.univariates). Missing values should be
-            represented with ``NaN``. May also be a pandas Series for univariate
-            time series.
-        :param check_times: whether to check that all times in the index are
-            unique (up to the millisecond) and sorted.
-        :param freq: if ``df`` is not indexed by time, this is the frequency
-            at which we will assume it is sampled.
+        :param df: A ``pandas.DataFrame`` with a ``DatetimeIndex``. Each column corresponds to a different variable of
+            the time series, and the  key of column (in sorted order) give the relative order of those variables in
+            ``self.univariates``. Missing values should be represented with ``NaN``. May also be a ``pandas.Series``
+            for single-variable time series.
+        :param check_times: whether to check that all times in the index are unique (up to the millisecond) and sorted.
+        :param drop_nan: whether to drop all ``NaN`` entries before creating the time series. Specifying ``False`` is
+            useful if you wish to impute the values on your own.
+        :param freq: if ``df`` is not indexed by time, this is the frequency at which we will assume it is sampled.
 
         :rtype: TimeSeries
         :return: the `TimeSeries` object corresponding to ``df``.
         """
-        if isinstance(df, pd.Series):
-            return cls({df.name: UnivariateTimeSeries.from_pd(df[~df.isna()])})
+        if df is None:
+            return None
+        elif isinstance(df, TimeSeries):
+            return df
+        elif isinstance(df, UnivariateTimeSeries):
+            return cls([df])
+        elif isinstance(df, pd.Series):
+            if drop_nan:
+                df = df[~df.isna()]
+            return cls({df.name: UnivariateTimeSeries.from_pd(df)})
         elif isinstance(df, np.ndarray):
             arr = df.reshape(len(df), -1).T
             ret = cls([UnivariateTimeSeries(time_stamps=None, values=v, freq=freq) for v in arr], check_aligned=False)
@@ -744,10 +791,18 @@ class TimeSeries:
         # Time series is not aligned iff there are missing values
         aligned = df.shape[1] == 1 or not df.isna().any().any()
 
+        # Check for a string-type index
+        if df.index.dtype == "O":
+            df = df.copy()
+            df.index = pd.to_datetime(df.index)
+
         # Make sure there are no time duplicates (by milliseconds) if desired
         dt_index = isinstance(df.index, pd.DatetimeIndex)
         if check_times:
-            df = df[~df.index.duplicated()].sort_index()
+            if not df.index.is_unique:
+                df = df[~df.index.duplicated()]
+            if not df.index.is_monotonic_increasing:
+                df = df.sort_index()
             if dt_index:
                 times = df.index.values.astype("datetime64[ms]").astype(np.int64)
                 df = df.reindex(pd.to_datetime(np.unique(times), unit="ms"), method="bfill")
@@ -760,25 +815,28 @@ class TimeSeries:
                 f"type {type(df.index).__name__}"
             )
 
-        ret = cls(
-            ValIterOrderedDict(
-                [(k, UnivariateTimeSeries.from_pd(ser[~ser.isna()], freq=freq)) for k, ser in df.items()]
-            ),
-            check_aligned=False,
-        )
+        if drop_nan and not aligned:
+            ret = cls(
+                ValIterOrderedDict(
+                    [(k, UnivariateTimeSeries.from_pd(ser[~ser.isna()], freq=freq)) for k, ser in df.items()]
+                ),
+                check_aligned=False,
+            )
+        else:
+            ret = cls(
+                ValIterOrderedDict([(k, UnivariateTimeSeries.from_pd(ser, freq=freq)) for k, ser in df.items()]),
+                check_aligned=False,
+            )
         ret._is_aligned = aligned
         return ret
 
     @classmethod
     def from_ts_list(cls, ts_list, *, check_aligned=True):
         """
-        :param Iterable[TimeSeries] ts_list: iterable of time series we wish to
-            form a multivariate time series with
-        :param bool check_aligned: whether to check if the output time series is
-            aligned
+        :param Iterable[TimeSeries] ts_list: iterable of time series we wish to form a multivariate time series with
+        :param bool check_aligned: whether to check if the output time series is aligned
         :rtype: TimeSeries
-        :return: A multivariate `TimeSeries` created from all the time series in
-            the inputs.
+        :return: A multivariate `TimeSeries` created from all the time series in  the inputs.
         """
         ts_list = list(ts_list)
         all_names = [set(ts.names) for ts in ts_list]
@@ -804,28 +862,20 @@ class TimeSeries:
         missing_value_policy: MissingValuePolicy = MissingValuePolicy.Interpolate,
     ):
         """
-        Aligns all the univariate time series comprising this multivariate time
-        series so that they all have the same time stamps.
+        Aligns all the univariates comprising this multivariate time series so that they all have the same time stamps.
 
-        :param reference: A specific set of timestamps we want the resampled
-            time series to contain. Required if ``alignment_policy`` is
-            `AlignPolicy.FixedReference`. Overrides other alignment policies
-            if specified.
-        :param granularity: The granularity (in seconds) of the resampled time
-            time series. Defaults to the GCD time difference between adjacent
-            elements of ``reference`` (when available) or ``time_series``
-            (otherwise). Ignored if ``reference`` is given or ``alignment_policy``
-            is `AlignPolicy.FixedReference`. Overrides other alignment policies
-            if specified.
-        :param origin: The first timestamp of the resampled time series. Only
-            used if the alignment policy is AlignPolicy.FixedGranularity.
-        :param remove_non_overlapping: If ``True``, we will only keep the portions
-            of the univariates that overlap with each other. For example, if we
-            have 3 univariates which span timestamps [0, 3600], [60, 3660], and
-            [30, 3540], we will only keep timestamps in the range [60, 3540]. If
-            ``False``, we will keep all timestamps produced by the resampling.
-        :param alignment_policy: The policy we want to use to align the time
-            time series.
+        :param reference: A specific set of timestamps we want the resampled time series to contain. Required if
+            ``alignment_policy`` is `AlignPolicy.FixedReference`. Overrides other alignment policies if specified.
+        :param granularity: The granularity (in seconds) of the resampled time time series. Defaults to the GCD time
+            difference between adjacent elements of ``time_series`` (otherwise). Ignored if ``reference`` is given or
+            ``alignment_policy`` is `AlignPolicy.FixedReference`. Overrides other alignment policies if specified.
+        :param origin: The first timestamp of the resampled time series. Only used if the alignment policy is
+            `AlignPolicy.FixedGranularity`.
+        :param remove_non_overlapping: If ``True``, we will only keep the portions of the univariates that overlap with
+            each other. For example, if we have 3 univariates which span timestamps [0, 3600], [60, 3660], and
+            [30, 3540], we will only keep timestamps in the range [60, 3540]. If ``False``, we will keep all timestamps
+            produced by the resampling.
+        :param alignment_policy: The policy we want to use to align the time series.
 
             - `AlignPolicy.FixedReference` aligns each single-variable time
               series to ``reference``, a user-specified sequence of timestamps.
@@ -836,10 +886,8 @@ class TimeSeries:
               all timestamps present in any single-variable time series.
             - `AlignPolicy.InnerJoin` returns a time series with the intersection
               of all timestamps present in all single-variable time series.
-        :param aggregation_policy: The policy used to aggregate windows of adjacent
-            observations when downsampling.
-        :param missing_value_policy: The policy used to impute missing values
-            created when upsampling.
+        :param aggregation_policy: The policy used to aggregate windows of adjacent observations when downsampling.
+        :param missing_value_policy: The policy used to impute missing values created when upsampling.
 
         :rtype: TimeSeries
         :return: The resampled multivariate time series.
@@ -850,7 +898,7 @@ class TimeSeries:
                     "Attempting to align an empty time series to a set of reference time stamps or a "
                     "fixed granularity. Doing nothing."
                 )
-            return self.__class__.from_pd(self.to_pd())
+            return TimeSeries.from_pd(self.to_pd())
 
         if reference is not None or alignment_policy is AlignPolicy.FixedReference:
             if reference is None:
@@ -888,15 +936,17 @@ class TimeSeries:
                     f"so we are using alignment policy FixedGranularity."
                 )
 
-            # Get the granularity in seconds, if one is specified. Otherwise,
-            # find the GCD granularity of  all the timedeltas that appear in any
-            # of the univariate series.
+            # Get the granularity in seconds, if one is specified and the granularity is a fixed number of seconds.
+            # Otherwise, infer the granularity. If we have a non-fixed granularity, record that fact.
+            fixed_granularity = True
             if granularity is None:
                 granularity = infer_granularity(self.time_stamps)
-            try:
-                granularity = pd.to_timedelta(granularity, unit="s")
-            except:
-                granularity = to_offset(granularity)
+            granularity = to_offset(granularity)
+            if isinstance(granularity, pd.DateOffset):
+                try:
+                    granularity.nanos
+                except ValueError:
+                    fixed_granularity = False
 
             # Remove non-overlapping portions of univariates if desired
             df = self.to_pd()
@@ -909,14 +959,22 @@ class TimeSeries:
             if origin is None and isinstance(granularity, pd.Timedelta):
                 elapsed = df.index[-1] - df.index[0]
                 origin = df.index[0] + elapsed % granularity
-            origin = to_pd_datetime(origin)
-            new_df = df.resample(granularity, origin=origin, label="right", closed="right")
+            direction = None if not fixed_granularity else "right"
+            new_df = df.resample(granularity, origin=to_pd_datetime(origin), label=direction, closed=direction)
 
-            # Apply aggregation & missing value imputation policies, and make sure we don't hallucinate new data
+            # Apply aggregation & missing value imputation policies
             new_df = aggregation_policy.value(new_df)
-            new_df = missing_value_policy.value(new_df)
-            new_df = new_df[df.index[0] : df.index[-1]]
-            return TimeSeries.from_pd(new_df.ffill().bfill(), check_times=False)
+            if missing_value_policy is MissingValuePolicy.Interpolate and not fixed_granularity:
+                new_df = new_df.interpolate()
+            else:
+                new_df = missing_value_policy.value(new_df)
+
+            # Add the date offset only if we're resampling to a non-fixed granularity
+            if not fixed_granularity:
+                new_df.index += get_date_offset(time_stamps=new_df.index, reference=df.index)
+
+            # Do any forward-filling/back-filling to cover all the indices
+            return TimeSeries.from_pd(new_df[df.index[0] : df.index[-1]].ffill().bfill(), check_times=False)
 
         elif alignment_policy in [None, AlignPolicy.OuterJoin]:
             # Outer join is the union of all timestamps appearing in any of the
@@ -948,72 +1006,20 @@ class TimeSeries:
                 )
             t = to_pd_datetime(sorted(t))
             return TimeSeries.from_pd(self.to_pd().loc[t], check_times=False)
-
         else:
             raise RuntimeError(f"Alignment policy {alignment_policy.name} not supported")
 
 
-def ts_csv_load(file_name: str, ms=True, n_vars=None) -> TimeSeries:
-    """
-    :param file_name: a csv file starting with the field timestamp followed by
-        all the all variable names.
-    :param ms: whether the timestamps are in milliseconds (rather than seconds)
-    :return: A merlion `TimeSeries` object.
-    """
-    with open(file_name, "r") as f:
-        header = True
-        for line in f:
-            if header:
-                header = False
-                names = line.strip().split(",")[1:]
-                vars = {name: [] for name in names}
-                stamps = []
-                continue
-            if not line:
-                continue
-            words = line.strip().split(",")
-            stamp, vals = int(words[0]), words[1:]
-            if ms:
-                stamp = stamp / 1000
-            stamps += [stamp]
-            for name, val in zip(names, vals):
-                vars[name] += [float(val)]
-
-    return TimeSeries([UnivariateTimeSeries(stamps, vals, name) for name, vals in vars.items()][:n_vars])
-
-
-def ts_to_csv(time_series: TimeSeries, file_name: str):
-    """
-    :param time_series: the `TimeSeries` object to write to a csv.
-    :param file_name: the name to assign the csv file.
-    """
-    with open(file_name, "w") as f:
-        header = ",".join(["timestamp"] + time_series.names)
-        f.write(f"{header}\n")
-        for t, x in time_series:
-            vals = ",".join([str(v) for v in (int(t),) + x])
-            f.write(f"{vals}\n")
-
-
-def assert_equal_timedeltas(time_series: UnivariateTimeSeries, timedelta: float = None):
+def assert_equal_timedeltas(time_series: UnivariateTimeSeries, granularity, offset=None):
     """
     Checks that all time deltas in the time series are equal, either to each
     other, or a pre-specified timedelta (in seconds).
     """
-    if pd.infer_freq(time_series.index) is not None:
+    if len(time_series) <= 2:
         return
-    if len(time_series) >= 2:
-        timedeltas = np.diff(time_series.np_time_stamps)
-        if timedelta is None:
-            timedelta = timedeltas[0]
-            assert timedelta > 0, "All times in the time series must be distinct."
-        else:
-            assert timedelta > 0
-
-        assert (
-            np.abs(timedeltas - timedeltas[0]).max() < 2e-3
-        ), f"Data must be sampled with the same time difference between each element of the time series"
-        assert np.abs(timedeltas[0] - timedelta) < 2e-3, (
-            f"Expected data to be sampled every {timedelta} seconds, but time "
-            f"series is sampled every {timedeltas[0]} seconds instead."
-        )
+    index = time_series.index
+    offset = pd.to_timedelta(0) if offset is None else offset
+    expected = pd.date_range(start=index[0], end=index[-1], freq=granularity) + offset
+    deviation = expected - time_series.index[-len(expected) :]
+    max_deviation = np.abs(deviation.total_seconds().values).max()
+    assert max_deviation < 2e-3, f"Data must have the same time difference between each element of the time series"

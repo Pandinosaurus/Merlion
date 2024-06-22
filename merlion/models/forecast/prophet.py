@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,17 +7,20 @@
 """
 Wrapper around Facebook's popular Prophet model for time series forecasting.
 """
+import copy
 import logging
 import os
 from typing import Iterable, List, Tuple, Union
+import warnings
 
-import prophet
 import numpy as np
 import pandas as pd
+import prophet
+import prophet.serialize
 
 from merlion.models.automl.seasonality import SeasonalityModel
-from merlion.models.forecast.base import ForecasterBase, ForecasterConfig
-from merlion.utils import TimeSeries, UnivariateTimeSeries, to_pd_datetime
+from merlion.models.forecast.base import ForecasterExogBase, ForecasterExogConfig
+from merlion.utils import TimeSeries, UnivariateTimeSeries, to_pd_datetime, to_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +58,7 @@ class _suppress_stdout_stderr(object):
             os.close(fd)
 
 
-class ProphetConfig(ForecasterConfig):
+class ProphetConfig(ForecasterExogConfig):
     """
     Configuration class for Facebook's `Prophet` model, as described by
     `Taylor & Letham, 2017 <https://peerj.com/preprints/3190/>`__.
@@ -109,7 +112,7 @@ class ProphetConfig(ForecasterConfig):
         self.holidays = holidays
 
 
-class Prophet(SeasonalityModel, ForecasterBase):
+class Prophet(ForecasterExogBase, SeasonalityModel):
     """
     Facebook's model for time series forecasting. See docs for `ProphetConfig`
     and `Taylor & Letham, 2017 <https://peerj.com/preprints/3190/>`__ for more details.
@@ -127,19 +130,27 @@ class Prophet(SeasonalityModel, ForecasterBase):
             uncertainty_samples=self.uncertainty_samples,
             holidays=None if self.holidays is None else pd.DataFrame(self.holidays),
         )
-        self.last_forecast_time_stamps_full = None
-        self.last_forecast_time_stamps = None
-        self.resid_samples = None
+
+    @property
+    def require_even_sampling(self) -> bool:
+        return False
 
     def __getstate__(self):
-        stan_backend = self.model.stan_backend
-        if hasattr(stan_backend, "logger"):
-            model_logger = self.model.stan_backend.logger
-            self.model.stan_backend.logger = None
-        state_dict = super().__getstate__()
-        if hasattr(stan_backend, "logger"):
-            self.model.stan_backend.logger = model_logger
-        return state_dict
+        try:
+            model = prophet.serialize.model_to_json(self.model)
+        except ValueError:  # prophet.serialize only works for fitted models, so deepcopy as a backup
+            model = copy.deepcopy(self.model)
+        return {k: model if k == "model" else copy.deepcopy(v) for k, v in self.__dict__.items()}
+
+    def __setstate__(self, state):
+        if "model" in state:
+            model = state["model"]
+            if isinstance(model, str):
+                state = copy.copy(state)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    state["model"] = prophet.serialize.model_from_json(model)
+        super().__setstate__(state)
 
     @property
     def yearly_seasonality(self):
@@ -175,89 +186,69 @@ class Prophet(SeasonalityModel, ForecasterBase):
         for p in theta:
             if p > 1:
                 period = p * dt.total_seconds() / 86400
-                logger.info(f"Add seasonality {str(p)} ({p * dt})")
+                logger.debug(f"Add seasonality {str(p)} ({p * dt})")
                 self.model.add_seasonality(name=f"extra_season_{p}", period=period, fourier_order=p)
 
-    def train(self, train_data: TimeSeries, train_config=None):
-        train_data = self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
-        series = train_data.univariates[self.target_name]
-        df = pd.DataFrame({"ds": series.index, "y": series.np_values})
+    def _add_exog_data(self, data: pd.DataFrame, exog_data: pd.DataFrame):
+        df = pd.DataFrame(data[self.target_name].rename("y"))
+        if exog_data is not None:
+            df = df.join(exog_data, how="outer")
+        df.index.rename("ds", inplace=True)
+        df.reset_index(inplace=True)
+        return df
 
+    def _train_with_exog(
+        self, train_data: pd.DataFrame, train_config=None, exog_data: pd.DataFrame = None
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        if exog_data is not None:
+            for col in exog_data.columns:
+                self.model.add_regressor(col)
+
+        df = self._add_exog_data(train_data, exog_data)
         with _suppress_stdout_stderr():
             self.model.fit(df)
 
-        # Get & return prediction & errors for train data
+        # Get & return prediction & errors for train data.
+        # sigma computation based on https://github.com/facebook/prophet/issues/549#issuecomment-435482584
         self.model.uncertainty_samples = 0
         forecast = self.model.predict(df)["yhat"].values.tolist()
+        sigma = (self.model.params["sigma_obs"] * self.model.y_scale).item()
         self.model.uncertainty_samples = self.uncertainty_samples
-        samples = self.model.predictive_samples(df)["yhat"]
-        samples = samples - np.expand_dims(forecast, -1)
-
-        yhat = UnivariateTimeSeries(df.ds, forecast, self.target_name).to_ts()
-        err = UnivariateTimeSeries(df.ds, np.std(samples, axis=-1), f"{self.target_name}_err").to_ts()
+        yhat = pd.DataFrame(forecast, index=df.ds, columns=[self.target_name])
+        err = pd.DataFrame(sigma, index=df.ds, columns=[f"{self.target_name}_err"])
         return yhat, err
 
-    def forecast(
+    def _forecast_with_exog(
         self,
-        time_stamps: Union[int, List[int]],
-        time_series_prev: TimeSeries = None,
-        return_iqr=False,
+        time_stamps: List[int],
+        time_series_prev: pd.DataFrame = None,
         return_prev=False,
-    ) -> Union[Tuple[TimeSeries, TimeSeries], Tuple[TimeSeries, TimeSeries, TimeSeries]]:
-        if isinstance(time_stamps, (int, float)):
-            times = pd.date_range(start=self.last_train_time, freq=self.timedelta, periods=int(time_stamps))[1:]
-        else:
-            times = to_pd_datetime(time_stamps)
-
+        exog_data: pd.DataFrame = None,
+        exog_data_prev: pd.DataFrame = None,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         # Construct data frame for prophet
-        df = pd.DataFrame()
+        time_stamps = to_pd_datetime(time_stamps)
+        df = self._add_exog_data(data=pd.DataFrame({self.target_name: np.nan}, index=time_stamps), exog_data=exog_data)
         if time_series_prev is not None:
-            series = self.transform(time_series_prev)
-            series = series.univariates[series.names[self.target_seq_index]]
-            df = pd.DataFrame({"ds": series.index, "y": series.np_values})
-        df = df.append(pd.DataFrame({"ds": times}))
+            past = self._add_exog_data(time_series_prev, exog_data_prev)
+            df = pd.concat((past, df))
+
+        # Determine the right set of timestamps to use
+        if return_prev and time_series_prev is not None:
+            time_stamps = df["ds"]
 
         # Get MAP estimate from prophet
         self.model.uncertainty_samples = 0
         yhat = self.model.predict(df)["yhat"].values
         self.model.uncertainty_samples = self.uncertainty_samples
 
-        # Use posterior sampling get the uncertainty for this forecast
-        if time_series_prev is not None:
-            time_stamps_full = time_series_prev.time_stamps + time_stamps
-        else:
-            time_stamps_full = time_stamps
+        # Get posterior samples for uncertainty estimation
+        resid_samples = self.model.predictive_samples(df)["yhat"] - np.expand_dims(yhat, -1)
 
-        if self.last_forecast_time_stamps_full != time_stamps_full:
-            samples = self.model.predictive_samples(df)["yhat"]
-            self.last_forecast_time_stamps_full = time_stamps_full
-            if self.last_forecast_time_stamps != time_stamps:
-                self.resid_samples = samples - np.expand_dims(yhat, -1)
-                self.last_forecast_time_stamps = time_stamps
-            else:
-                n = len(time_stamps)
-                prev = samples[:-n] - np.expand_dims(yhat[:-n], -1)
-                self.resid_samples = np.concatenate((prev, self.resid_samples))
-
-        if not return_prev:
-            yhat = yhat[-len(time_stamps) :]
-            t = time_stamps
-        else:
-            t = time_stamps_full
-
-        t = t[-len(yhat) :]
-        samples = self.resid_samples[-len(yhat) :]
+        # Return the MAP estimate & stderr
+        yhat = yhat[-len(time_stamps) :]
+        resid_samples = resid_samples[-len(time_stamps) :]
         name = self.target_name
-        if return_iqr:
-            lb = UnivariateTimeSeries(
-                name=f"{name}_lower", time_stamps=t, values=yhat + np.percentile(samples, 25, axis=-1)
-            ).to_ts()
-            ub = UnivariateTimeSeries(
-                name=f"{name}_upper", time_stamps=t, values=yhat + np.percentile(samples, 75, axis=-1)
-            ).to_ts()
-            yhat = UnivariateTimeSeries(t, yhat, name).to_ts()
-            return yhat, ub, lb
-        else:
-            yhat = UnivariateTimeSeries(t, yhat, name).to_ts()
-            err = UnivariateTimeSeries(t, np.std(samples, axis=-1), f"{name}_err").to_ts()
-            return yhat, err
+        yhat = pd.DataFrame(yhat, index=time_stamps, columns=[name])
+        err = pd.DataFrame(np.std(resid_samples, axis=-1), index=time_stamps, columns=[f"{name}_err"])
+        return yhat, err

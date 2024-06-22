@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2022 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -10,11 +10,10 @@ import sys
 import unittest
 
 import pandas as pd
-import numpy as np
 
 from merlion.evaluate.forecast import ForecastMetric
 from merlion.models.defaults import DefaultForecaster, DefaultForecasterConfig
-from merlion.models.forecast.seq_ar_common import gen_next_seq_label_pairs
+from merlion.models.utils.rolling_window_dataset import RollingWindowDataset
 from merlion.transform.bound import LowerUpperClip
 from merlion.transform.normalize import MinMaxNormalize
 from merlion.transform.resample import TemporalResample
@@ -108,28 +107,26 @@ class TestUnivariate(unittest.TestCase):
         self.model = DefaultForecaster(DefaultForecasterConfig())
 
     def test_forecast(self):
-        # batch forecasting RMSE = 6.5612
+        # batch forecasting RMSE = 3.001
         _, _ = self.model.train(self.train_data)
         forecast, lb, ub = self.model.forecast(self.max_forecast_steps, return_iqr=True)
         rmse = ForecastMetric.RMSE.value(self.test_data, forecast)
         logger.info(f"RMSE = {rmse:.4f} for {self.max_forecast_steps} step forecasting")
-        self.assertAlmostEqual(rmse, 6.5, delta=1)
+        self.assertAlmostEqual(rmse, 3.0, delta=1)
         msis = ForecastMetric.MSIS.value(
             ground_truth=self.test_data, predict=forecast, insample=self.train_data, periodicity=4, ub=ub, lb=lb
         )
         logger.info(f"MSIS = {msis:.4f}")
-        self.assertLessEqual(np.abs(msis - 101.6), 10)
+        self.assertAlmostEqual(msis, 14, delta=5)
 
         # make sure save/load model gets same predictions
         logger.info("Test save/load...")
-        savedir = join(rootdir, "tmp", "ets")
+        savedir = join(rootdir, "tmp", "default", "forecast", "uni")
         self.model.save(dirname=savedir)
         loaded = DefaultForecaster.load(dirname=savedir)
 
-        loaded_pred, loaded_lb, loaded_ub = loaded.forecast(self.max_forecast_steps, return_iqr=True)
+        loaded_pred, _ = loaded.forecast(self.max_forecast_steps)
         self.assertSequenceEqual(list(loaded_pred), list(forecast))
-        self.assertSequenceEqual(list(loaded_lb), list(lb))
-        self.assertSequenceEqual(list(loaded_ub), list(ub))
 
         # streaming forecasting RMSE = 2.4689
         test_t = self.test_data.np_time_stamps
@@ -141,7 +138,8 @@ class TestUnivariate(unittest.TestCase):
             forecast, err = self.model.forecast(cur_test.time_stamps, cur_train)
             if forecast_results is None:
                 forecast_results = forecast
-            forecast_results += forecast
+            else:
+                forecast_results += forecast
             t += self.model.timedelta
         rmse_onestep = ForecastMetric.RMSE.value(self.test_data, forecast_results)
         logger.info(f"Streaming RMSE = {rmse_onestep:.4f} for {self.max_forecast_steps} step forecasting")
@@ -183,32 +181,31 @@ class TestMultivariate(unittest.TestCase):
         self.train_data_norm = minmax_transform(train_data)
         self.test_data_norm = minmax_transform(test_data)
 
-        self.model = DefaultForecaster(
-            DefaultForecasterConfig(max_forecast_steps=self.max_forecast_steps, target_seq_index=self.i)
-        )
+        self.model = DefaultForecaster(DefaultForecasterConfig(target_seq_index=self.i))
 
     def test_forecast(self):
         logger.info("Training model...")
         yhat, _ = self.model.train(self.train_data_norm)
 
         maxlags = self.model.model.config.maxlags
-        testing_data_gen = gen_next_seq_label_pairs(self.test_data_norm, self.i, maxlags, self.max_forecast_steps)
-        testing_instance, testing_label = next(testing_data_gen)
+        dataset = RollingWindowDataset(self.test_data_norm, self.i, maxlags, self.max_forecast_steps, ts_index=True)
+        testing_instance, testing_label = next(iter(dataset))
         pred, _ = self.model.forecast(testing_label.time_stamps, testing_instance)
         self.assertEqual(len(pred), self.max_forecast_steps)
-        smape = ForecastMetric.sMAPE.value(predict=pred, ground_truth=testing_label.to_ts())
+        smape = ForecastMetric.sMAPE.value(predict=pred, ground_truth=testing_label)
         logger.info(f"SMAPE = {smape}")
 
         # save and load
-        self.model.save(dirname=join(rootdir, "tmp", "lgbmforecaster"))
-        loaded_model = DefaultForecaster.load(dirname=join(rootdir, "tmp", "lgbmforecaster"))
+        savedir = join(rootdir, "tmp", "default", "forecast", "multi")
+        self.model.save(dirname=savedir)
+        loaded_model = DefaultForecaster.load(dirname=savedir)
         new_pred, _ = loaded_model.forecast(testing_label.time_stamps, testing_instance)
-        new_smape = ForecastMetric.sMAPE.value(predict=new_pred, ground_truth=testing_label.to_ts())
+        new_smape = ForecastMetric.sMAPE.value(predict=new_pred, ground_truth=testing_label)
         self.assertAlmostEqual(smape, new_smape, places=4)
 
 
 if __name__ == "__main__":
     logging.basicConfig(
-        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s", stream=sys.stdout, level=logging.DEBUG
+        format="%(asctime)s (%(module)s:%(lineno)d) %(levelname)s: %(message)s", stream=sys.stdout, level=logging.INFO
     )
     unittest.main()

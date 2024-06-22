@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -11,6 +11,7 @@ from math import log
 from typing import List
 
 import numpy as np
+import pandas as pd
 
 from merlion.models.base import NormalizingConfig
 from merlion.models.anomaly.base import DetectorBase, DetectorConfig
@@ -83,7 +84,7 @@ class ZMSConfig(DetectorConfig, NormalizingConfig):
         the output dimension (number of lags) will change.
         """
         self._n_lags = n
-        lags = [LagTransform(self.base ** k, pad=True) for k in range(n)] if n is not None else []
+        lags = [LagTransform(self.base**k, pad=True) for k in range(n)] if n is not None else []
         self.lags = TransformStack([Identity(), *lags])
         self.normalize = MeanVarNormalize()
 
@@ -116,6 +117,14 @@ class ZMS(DetectorBase):
     config_class = ZMSConfig
 
     @property
+    def require_even_sampling(self) -> bool:
+        return False
+
+    @property
+    def require_univariate(self) -> bool:
+        return False
+
+    @property
     def n_lags(self):
         return self.config.n_lags
 
@@ -136,19 +145,17 @@ class ZMS(DetectorBase):
         return self.lag_inflation > 0.0 and len(self.lag_scales) > 1
 
     def train(
-        self, train_data: TimeSeries, anomaly_labels: TimeSeries = None, train_config=None, post_rule_train_config=None
+        self, train_data: TimeSeries, train_config=None, anomaly_labels: TimeSeries = None, post_rule_train_config=None
     ) -> TimeSeries:
         if self.n_lags is None:
             self.n_lags = int(log(len(train_data), self.config.base))
+        return super().train(train_data, train_config, anomaly_labels, post_rule_train_config)
 
-        self.train_pre_process(train_data, require_even_sampling=False, require_univariate=False)
-        train_scores = self.get_anomaly_score(train_data)
-        self.train_post_rule(train_scores, anomaly_labels, post_rule_train_config)
-        return train_scores
+    def _train(self, train_data: pd.DataFrame, train_config=None) -> pd.DataFrame:
+        return self._get_anomaly_score(train_data)
 
-    def get_anomaly_score(self, time_series: TimeSeries, time_series_prev: TimeSeries = None) -> TimeSeries:
-        time_series, _ = self.transform_time_series(time_series, time_series_prev)
-        z_scores = time_series.to_pd().values
+    def _get_anomaly_score(self, time_series: pd.DataFrame, time_series_prev: pd.DataFrame = None) -> pd.DataFrame:
+        z_scores = time_series.values
 
         if self.adjust_z_scores:
             # choose z-score according to adjusted z-scores
@@ -160,4 +167,4 @@ class ZMS(DetectorBase):
         else:
             scores = np.nanmax(np.abs(z_scores), axis=1)
 
-        return UnivariateTimeSeries(time_stamps=time_series.time_stamps, values=scores, name="anom_score").to_ts()
+        return pd.DataFrame(scores, index=time_series.index, columns=["anom_score"])

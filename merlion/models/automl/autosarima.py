@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2023 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -7,21 +7,22 @@
 """
 Automatic hyperparameter selection for SARIMA.
 """
-from collections import Iterator
 from copy import copy, deepcopy
 import logging
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Iterator, Optional, Tuple, Union
 
 import numpy as np
 
 from merlion.models.automl.seasonality import PeriodicityStrategy, SeasonalityConfig, SeasonalityLayer
 from merlion.models.forecast.sarima import Sarima
+from merlion.models.utils import autosarima_utils
 from merlion.transform.resample import TemporalResample
-from merlion.utils import autosarima_utils, TimeSeries, UnivariateTimeSeries
+from merlion.utils import TimeSeries, UnivariateTimeSeries
 
 logger = logging.getLogger(__name__)
 
 
+# FIXME: convert to information criterion version
 class AutoSarimaConfig(SeasonalityConfig):
     """
     Configuration class for `AutoSarima`. Acts as a wrapper around a `Sarima` model, which automatically detects
@@ -54,6 +55,7 @@ class AutoSarimaConfig(SeasonalityConfig):
     ):
         """
         :param auto_seasonality: Whether to automatically detect the seasonality.
+        :param periodicity_strategy: Periodicity Detection Strategy.
         :param auto_pqPQ: Whether to automatically choose AR/MA orders ``p, q`` and seasonal AR/MA orders ``P, Q``.
         :param auto_d: Whether to automatically choose the difference order ``d``.
         :param auto_D: Whether to automatically choose the seasonal difference order ``D``.
@@ -94,12 +96,13 @@ class AutoSarimaConfig(SeasonalityConfig):
 class AutoSarima(SeasonalityLayer):
 
     config_class = AutoSarimaConfig
-    require_even_sampling = True
-    require_univariate = True
+
+    @property
+    def supports_exog(self):
+        return True
 
     def _generate_sarima_parameters(self, train_data: TimeSeries) -> dict:
         y = train_data.univariates[self.target_name].np_values
-        X = None
 
         order = list(self.config.order)
         seasonal_order = list(self.config.seasonal_order)
@@ -207,7 +210,6 @@ class AutoSarima(SeasonalityLayer):
 
         return_dict = dict(
             y=y,
-            X=X,
             p=p,
             d=d,
             q=q,
@@ -280,20 +282,18 @@ class AutoSarima(SeasonalityLayer):
         return iter([{"action": action, "theta": [order, seasonal_order, trend], "val_dict": val_dict}])
 
     def evaluate_theta(
-        self, thetas: Iterator, train_data: TimeSeries, train_config=None
+        self, thetas: Iterator, train_data: TimeSeries, train_config=None, exog_data: TimeSeries = None
     ) -> Tuple[Any, Optional[Sarima], Optional[Tuple[TimeSeries, Optional[TimeSeries]]]]:
-
-        theta_value = next(thetas)
 
         # preprocess
         train_config = copy(train_config) if train_config is not None else {}
-        if "enforce_stationarity" not in train_config:
-            train_config["enforce_stationarity"] = False
-        if "enforce_invertibility" not in train_config:
-            train_config["enforce_invertibility"] = False
+        if exog_data is not None:
+            train_config["exog"] = exog_data.to_pd()
+
+        # read from val_dict
+        theta_value = next(thetas)
         val_dict = theta_value["val_dict"]
         y = val_dict["y"]
-        X = val_dict["X"]
         method = val_dict["method"]
         maxiter = val_dict["maxiter"]
         information_criterion = val_dict["information_criterion"]
@@ -348,7 +348,6 @@ class AutoSarima(SeasonalityLayer):
                 seasonal_order = [0, 0, 0, 0]
             best_model_fit, fit_time, ic = autosarima_utils._fit_sarima_model(
                 y=y,
-                X=X,
                 order=order,
                 seasonal_order=seasonal_order,
                 trend=trend,
@@ -359,19 +358,16 @@ class AutoSarima(SeasonalityLayer):
             )
 
         else:
-            return theta_value, None, None
+            return theta_value["theta"], None, None
 
+        # FIXME: model._last_val is not set correctly here
         model = deepcopy(self.model)
-        model.reset()
         self.set_theta(model, best_model_theta, train_data)
-
-        model.train_pre_process(train_data, require_even_sampling=True, require_univariate=False)
         model.model = best_model_fit
         name = model.target_name
-        train_data = train_data.univariates[name].to_pd()
-        times = train_data.index
+        times = train_data.univariates[name].index
         yhat = model.model.fittedvalues
-        err = [np.sqrt(model.model.params[-1])] * len(train_data)
+        err = [np.sqrt(model.model.params[-1])] * len(yhat)
         train_result = (
             UnivariateTimeSeries(times, yhat, name).to_ts(),
             UnivariateTimeSeries(times, err, f"{name}_err").to_ts(),

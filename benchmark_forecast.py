@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2021 salesforce.com, inc.
+# Copyright (c) 2022 salesforce.com, inc.
 # All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 # For full license text, see the LICENSE file in the repo root or https://opensource.org/licenses/BSD-3-Clause
@@ -27,7 +27,7 @@ from merlion.models.factory import ModelFactory
 from merlion.models.forecast.base import ForecasterBase
 from merlion.transform.resample import TemporalResample, granularity_str_to_seconds
 from merlion.utils import TimeSeries, UnivariateTimeSeries
-from merlion.utils.resample import get_gcd_timedelta
+from merlion.utils.resample import infer_granularity, to_pd_datetime
 
 from ts_datasets.base import BaseDataset
 from ts_datasets.forecast import *
@@ -59,6 +59,8 @@ def parse_args():
         "in ts_datasets/ts_datasets/forecast/__init__.py for "
         "valid options.",
     )
+    parser.add_argument("--data_root", default=None, help="Root directory/file of dataset.")
+    parser.add_argument("--data_kwargs", default="{}", help="JSON of keyword arguments for the data loader.")
     parser.add_argument(
         "--models",
         type=str,
@@ -122,6 +124,8 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    args.data_kwargs = json.loads(args.data_kwargs)
+    assert isinstance(args.data_kwargs, dict)
 
     # If not summarizing all results, we need at least one model to evaluate
     if args.summarize and args.models is None:
@@ -139,6 +143,9 @@ def get_dataset_name(dataset: BaseDataset) -> str:
     name = type(dataset).__name__
     if hasattr(dataset, "subset") and dataset.subset is not None:
         name += "_" + dataset.subset
+    if isinstance(dataset, CustomDataset):
+        root = dataset.rootdir
+        name = os.path.join(name, os.path.basename(os.path.dirname(root) if os.path.isfile(root) else root))
     return name
 
 
@@ -238,6 +245,7 @@ def train_model(
         i0 = pd.read_csv(csv).idx.max()
     else:
         i0 = -1
+        os.makedirs(os.path.dirname(csv), exist_ok=True)
         with open(csv, "w") as f:
             f.write("idx,name,horizon,retrain_type,n_retrain,RMSE,sMAPE\n")
 
@@ -257,12 +265,7 @@ def train_model(
             df = df.resample(dt, closed="right", label="right").mean().interpolate()
 
         vals = TimeSeries.from_pd(df)
-        # Get time-delta
-        if not is_multivariate_data:
-            dt = df.index[1] - df.index[0]
-        else:
-            dt = get_gcd_timedelta(vals.time_stamps)
-            dt = pd.to_timedelta(dt, unit="s")
+        dt = infer_granularity(vals.time_stamps)
 
         # Get the train/val split
         t = trainval.index[np.argmax(~trainval)].value // 1e9
@@ -296,7 +299,11 @@ def train_model(
         # loop over horizon conditions
         for horizon in horizons:
             horizon = granularity_str_to_seconds(horizon)
-            max_forecast_steps = math.ceil(horizon / dt.total_seconds())
+            try:
+                max_forecast_steps = int(math.ceil(horizon / dt.total_seconds()))
+            except:
+                window = TimeSeries.from_pd(test_vals.to_pd()[: to_pd_datetime(train_end_timestamp + horizon)])
+                max_forecast_steps = len(TemporalResample(granularity=dt)(window))
             logger.debug(f"horizon is {pd.Timedelta(seconds=horizon)} and max_forecast_steps is {max_forecast_steps}")
             if retrain_type == "without_retrain":
                 retrain_freq = None
@@ -305,9 +312,11 @@ def train_model(
             elif retrain_type == "sliding_window_retrain":
                 retrain_freq = math.ceil(test_window_len / int(n_retrain))
                 train_window = train_window_len
+                horizon = min(retrain_freq, horizon)
             elif retrain_type == "expanding_window_retrain":
                 retrain_freq = math.ceil(test_window_len / int(n_retrain))
                 train_window = None
+                horizon = min(retrain_freq, horizon)
             else:
                 raise ValueError(
                     "the retrain_type should be without_retrain, sliding_window_retrain or expanding_window_retrain"
@@ -326,15 +335,8 @@ def train_model(
                 config=ForecastEvaluatorConfig(train_window=train_window, horizon=horizon, retrain_freq=retrain_freq),
             )
 
-            # Initialize train config
-            train_kwargs = {}
-            if type(model).__name__ == "AutoSarima":
-                train_kwargs = {"train_config": {"enforce_stationarity": True, "enforce_invertibility": True}}
-
             # Get Evaluate Results
-            train_result, test_pred = evaluator.get_predict(
-                train_vals=train_vals, test_vals=test_vals, train_kwargs=train_kwargs, retrain_kwargs=train_kwargs
-            )
+            train_result, test_pred = evaluator.get_predict(train_vals=train_vals, test_vals=test_vals)
 
             rmses = evaluator.evaluate(ground_truth=test_vals, predict=test_pred, metric=ForecastMetric.RMSE)
             smapes = evaluator.evaluate(ground_truth=test_vals, predict=test_pred, metric=ForecastMetric.sMAPE)
@@ -420,7 +422,6 @@ def join_dfs(name2df: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 def summarize_full_df(full_df: pd.DataFrame) -> pd.DataFrame:
     # Get the names of all algorithms which have full results
     algs = [col[len("sMAPE") :] for col in full_df.columns if col.startswith("sMAPE") and not full_df[col].isna().any()]
-
     summary_df = pd.DataFrame({alg.lstrip("_"): [] for alg in algs})
 
     # Compute pooled (per time series) mean/median sMAPE, RMSE
@@ -452,7 +453,7 @@ def main():
         stream=sys.stdout,
         level=logging.DEBUG if args.debug else logging.INFO,
     )
-    dataset = get_dataset(args.dataset)
+    dataset = get_dataset(args.dataset, rootdir=args.data_root, **args.data_kwargs)
     dataset_name = get_dataset_name(dataset)
 
     if len(args.models) > 0:
@@ -505,24 +506,26 @@ def main():
             f"before trying to summarize their results."
         )
     for csv in sorted(csvs):
-        model_name = os.path.basename(os.path.dirname(csv))
-        suffix = re.search(f"(?<={dataset_name}).*(?=\\.csv)", os.path.basename(csv)).group(0)
+        basename = re.search(f"{dataset_name}.*\\.csv", csv).group(0)
+        model_name = os.path.basename(os.path.dirname(csv[: -len(basename)]))
+        suffix = re.search(f"(?<={dataset_name}).*(?=\\.csv)", basename).group(0)
         try:
             name2df[model_name + suffix] = pd.read_csv(csv)
         except Exception as e:
             logger.warning(f'Caught {type(e).__name__}: "{e}". Skipping csv file {csv}.')
             continue
 
-    # Join all the dataframes into one
+    # Join all the dataframes into one & summarize the results
     dirname = os.path.join(MERLION_ROOT, "results", "forecast")
     full_df = join_dfs(name2df)
-    full_df.to_csv(os.path.join(dirname, f"{dataset_name}_full.csv"), index=False)
-
-    # Summarize the joined dataframe
     summary_df = summarize_full_df(full_df)
-    summary_df.to_csv(os.path.join(dirname, f"{dataset_name}_summary.csv"), index=True)
     if args.summarize:
         print(summary_df)
+
+    full_fname, summary_fname = [os.path.join(dirname, f"{dataset_name}_{x}.csv") for x in ["full", "summary"]]
+    os.makedirs(os.path.dirname(full_fname), exist_ok=True)
+    full_df.to_csv(full_fname, index=False)
+    summary_df.to_csv(summary_fname, index=True)
 
 
 if __name__ == "__main__":
